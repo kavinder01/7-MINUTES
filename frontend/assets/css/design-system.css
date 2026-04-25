@@ -1,0 +1,458 @@
+/* ============================================================
+   ProteinFold-RL — Shared Design System v3
+   Readability upgrade via !important overrides —
+   beats inline <style> blocks without touching HTML files.
+   ============================================================ */
+
+@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;700;800&display=swap');
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:        #020c18;
+  --bg2:       #040f1f;
+  --bg3:       #061428;
+  --blue:      #3d9fff;
+  --blue-dim:  rgba(61,159,255,0.12);
+  --blue-mid:  rgba(61,159,255,0.25);
+  --teal:      #00d4aa;
+  --teal-dim:  rgba(0,212,170,0.10);
+  --red:       #ff5f5f;
+  --red-dim:   rgba(255,95,95,0.10);
+  --amber:     #ffb347;
+  --text:      #eaf4ff;
+  --text-dim:  rgba(180,210,240,0.72);
+  --text-mid:  rgba(180,210,240,0.90);
+  --border:    rgba(61,159,255,0.12);
+  --border-hi: rgba(61,159,255,0.30);
+  --mono:      'Space Mono', monospace;
+  --sans:      'Syne', sans-serif;
+  --nav-h:     60px;
+}
+
+html {
+  font-size: 16px;
+  line-height: 1.5;
+  -webkit-text-size-adjust: 100%;
+  scroll-behavior: smooth;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 1rem;
+  line-height: 1.7;
+  overflow-x: hidden;
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#stars-canvas {
+  position: fixed;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.page { position: relative; z-index: 2; }
+
+/* ============================================================
+   NAV
+   ============================================================ */
+.nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 2.5rem;
+  height: var(--nav-h);
+  border-bottom: 0.5px solid var(--border);
+  background: rgba(2,12,24,0.97);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+.nav-logo {
+  font-family: var(--mono);
+  font-size: 13px;
+  letter-spacing: 0.12em;
+  color: var(--blue);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.nav-logo-dot {
+  width: 8px; height: 8px;
+  background: var(--blue);
+  border-radius: 50%;
+  flex-shrink: 0;
+  animation: nav-blink 2.4s ease-in-out infinite;
+}
+@keyframes nav-blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.2; }
+}
+.nav-links {
+  display: flex;
+  list-style: none;
+  height: var(--nav-h);
+  margin: 0; padding: 0;
+}
+.nav-links a {
+  display: flex;
+  align-items: center;
+  padding: 0 22px;
+  height: 100%;
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  text-decoration: none;
+  border-right: 0.5px solid var(--border);
+  transition: color 0.15s, background 0.15s;
+  white-space: nowrap;
+}
+.nav-links a:first-child { border-left: 0.5px solid var(--border); }
+.nav-links a:hover  { color: var(--blue); background: var(--blue-dim); }
+.nav-links a.active { color: var(--blue); background: var(--blue-dim); }
+.nav-right {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  letter-spacing: 0.1em;
+  white-space: nowrap;
+}
+
+/* ============================================================
+   TICKER
+   ============================================================ */
+.ticker {
+  border-bottom: 0.5px solid var(--border);
+  background: var(--bg2);
+  overflow: hidden;
+  height: 42px;
+  display: flex;
+  align-items: center;
+}
+.ticker-track {
+  display: flex;
+  align-items: center;
+  white-space: nowrap;
+  animation: ticker-scroll 36s linear infinite;
+  will-change: transform;
+}
+@keyframes ticker-scroll {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-50%); }
+}
+.ticker-item {
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.1em;
+  color: var(--text-dim);
+  padding: 0 28px;
+  border-right: 0.5px solid var(--border);
+  line-height: 1;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 42px;
+}
+.ticker-item .v-blue  { color: var(--blue); }
+.ticker-item .v-teal  { color: var(--teal); }
+.ticker-item .v-amber { color: var(--amber); }
+
+/* ============================================================
+   SECTION LABEL
+   ============================================================ */
+.section-label {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: rgba(61,159,255,0.60);
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 2rem;
+}
+.section-label::after {
+  content: '';
+  flex: 1; height: 0.5px;
+  background: var(--border);
+}
+
+/* ============================================================
+   PASS BADGE
+   ============================================================ */
+.pass-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 1.1rem 2.5rem;
+  background: rgba(0,212,170,0.05);
+  border-top: 0.5px solid rgba(0,212,170,0.15);
+  border-bottom: 0.5px solid rgba(0,212,170,0.15);
+}
+.pass-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--teal);
+  flex-shrink: 0;
+  animation: pass-pulse 2s ease-in-out infinite;
+}
+@keyframes pass-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(0,212,170,0.5); }
+  50%       { box-shadow: 0 0 0 8px rgba(0,212,170,0); }
+}
+.pass-text {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: rgba(0,212,170,0.90);
+  letter-spacing: 0.07em;
+  line-height: 1.8;
+}
+
+/* ============================================================
+   FOOTER
+   ============================================================ */
+.footer {
+  padding: 1.5rem 2.5rem;
+  border-top: 0.5px solid var(--border);
+  background: var(--bg2);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.footer-l {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: rgba(120,160,200,0.60);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.footer-r {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: rgba(61,159,255,0.60);
+  letter-spacing: 0.1em;
+}
+
+/* ============================================================
+   BUTTONS
+   ============================================================ */
+.btn-primary {
+  background: var(--blue);
+  color: #020c18;
+  border: none;
+  padding: 13px 30px;
+  font-family: var(--sans);
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  border-radius: 2px;
+  transition: background 0.18s, transform 0.15s;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  line-height: 1;
+}
+.btn-primary:hover { background: #72baff; transform: translateY(-1px); }
+.btn-ghost {
+  background: transparent;
+  color: var(--text-mid);
+  border: 0.5px solid var(--border-hi);
+  padding: 13px 30px;
+  font-family: var(--mono);
+  font-size: 13px;
+  cursor: pointer;
+  border-radius: 2px;
+  transition: all 0.18s;
+  letter-spacing: 0.06em;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  line-height: 1;
+}
+.btn-ghost:hover { border-color: var(--blue); color: var(--blue); }
+
+/* ============================================================
+   TAGS
+   ============================================================ */
+.tag {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  padding: 6px 14px;
+  border: 0.5px solid rgba(61,159,255,0.20);
+  color: var(--text-dim);
+  border-radius: 1px;
+  transition: all 0.15s;
+  display: inline-block;
+  line-height: 1;
+}
+.tag:hover { border-color: var(--blue); color: var(--blue); background: var(--blue-dim); }
+
+/* ============================================================
+   RESPONSIVE
+   ============================================================ */
+@media (max-width: 768px) {
+  .nav       { padding: 0 1.25rem; }
+  .nav-links { display: none; }
+  .pass-row  { padding: 1rem 1.25rem; }
+  .footer    { padding: 1.25rem; }
+}
+
+/* ============================================================
+   READABILITY OVERRIDES
+   !important beats inline <style> blocks that load after this file.
+   All classes are defined in per-page <style> blocks with tiny px
+   values — these overrides fix them globally in one place.
+   ============================================================ */
+
+/* ── Labels & eyebrows (was 8–9px) ── */
+.dm-lbl,
+.vs-label,
+.mt-win-badge,
+.section-label,
+.dash-eyebrow,
+.demo-eyebrow,
+.cmp-eyebrow,
+.sci-eyebrow,
+.loop-idx,
+.loop-key,
+.ctrl-label,
+.metric-lbl,
+.metric-sub,
+.chart-box-meta,
+.chart-box-title,
+.chart-card-meta,
+.chart-card-title,
+.dist-card-title,
+.table-card-title,
+.rm-lbl,
+.strip-lbl,
+.rl-diagram-label,
+.result-chart-label,
+.step-log-label,
+.verdict-section-label,
+.insight-label,
+.status-badge,
+.status-info,
+.health-badge,
+.health-meta,
+.agent-desc,
+.opt-badge,
+.cmp-badge,
+.pp-desc,
+.slider-lbl,
+.slider-hint,
+.cmp-title,
+.mt-header-cell,
+.vs-win,
+.protein-label,
+.verdict-text,
+.sci-tag,
+.bar-name { font-size: 12px !important; }
+
+/* ── Secondary text (was 10–11px) ── */
+.agent-name,
+.arch-para,
+.cmp-subtitle,
+.cmp-sub,
+.dash-subtitle,
+.demo-subtitle,
+.sci-subtitle,
+.idle-sub,
+.loading-sub,
+.loading-text,
+.loop-val,
+.ls-key,
+.ls-val,
+.mt-cell,
+.mt-cell.label,
+.mt-cell.improve,
+.mt-cell:not(:first-child),
+.opt-desc,
+.opt-name,
+.pp-key,
+.pp-val,
+.rr-condition,
+.slider-val,
+.stack-name,
+.stack-role,
+.bar-val,
+.verdict-body,
+.why-card-desc,
+.justify-body,
+.eq-desc,
+.eq-label,
+.arch-table td { font-size: 14px !important; }
+
+/* ── Body paragraphs (was 11px) ── */
+.why-para,
+.arch-para,
+.insight-desc { font-size: 15px !important; }
+
+/* ── Line height for readability ── */
+.why-para,
+.arch-para,
+.verdict-body,
+.why-card-desc,
+.justify-body,
+.insight-desc,
+.eq-desc { line-height: 2.0 !important; }
+
+/* ── Opacity: all text-dim instances ── */
+.dash-eyebrow,
+.demo-eyebrow,
+.cmp-eyebrow,
+.sci-eyebrow,
+.dash-subtitle,
+.demo-subtitle,
+.cmp-subtitle,
+.sci-subtitle,
+.metric-lbl,
+.metric-sub,
+.dm-lbl,
+.agent-desc,
+.loop-key,
+.loop-idx,
+.ctrl-label,
+.chart-box-meta,
+.chart-card-meta,
+.ls-key,
+.pp-desc,
+.pp-key,
+.slider-lbl,
+.slider-hint,
+.bar-name,
+.rm-lbl,
+.rl-diagram-label,
+.result-chart-label,
+.step-log-label,
+.verdict-section-label,
+.status-info,
+.health-meta,
+.protein-label { color: var(--text-dim) !important; }
+
+/* ── Padding bumps for breathing room ── */
+.why-card { padding: 1.4rem 1.5rem !important; }
+.insight-card { padding: 2rem !important; }
+.loop-card { padding: 2rem 1.75rem !important; }
+.ppo-param-row { padding: 0.8rem 1.25rem !important; }
+.reward-row { padding: 0.85rem 1.25rem !important; }
+.mt-row { padding: 1rem 1.5rem !important; }
+.live-stat-row { padding: 0.75rem 1rem !important; }
+.log-row { padding: 6px 10px !important; }
