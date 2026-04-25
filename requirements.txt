@@ -1,0 +1,8 @@
+torch==2.6.0
+torch-geometric==2.7.0
+biopython
+gymnasium
+numpy
+gradio
+pandas
+scipy
