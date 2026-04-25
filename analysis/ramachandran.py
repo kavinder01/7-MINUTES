@@ -216,6 +216,7 @@ def plot_ramachandran(random_phi, random_psi,
         ax.legend(loc="upper right", fontsize=8,
                   facecolor="#1a1a2e", labelcolor="white",
                   edgecolor="#333355")
+        
 
     # ── Main title ────────────────────────────────────────────
     improvement = (trained_frac - random_frac) * 100
