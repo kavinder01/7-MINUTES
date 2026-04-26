@@ -1,0 +1,3122 @@
+Index: model/mpnn.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/model/mpnn.py b/model/mpnn.py
+--- a/model/mpnn.py	(revision 71456e9b6125c185e2860ce677a90484ef9d4150)
++++ b/model/mpnn.py	(date 1777138908725)
+@@ -1,0 +1,252 @@
++"""
++model/mpnn.py
++ProteinFold-RL — Message Passing Neural Network (v2)
++
++Upgraded from v1 (plain mean aggregation) to:
++  - Edge-gated attention  : each node learns which neighbours matter
++  - Layer normalisation   : stable training across proteins of all sizes
++  - Residual connections  : gradients flow cleanly through 4 layers
++
++Interface is identical to v1 — gnn_policy.py needs zero changes.
++
++  MPNNStack(node_dim=128, edge_dim=64, n_layers=4)
++  → forward(x, edge_index, edge_attr, batch=None)
++  → global embedding [1, 256]
++
++Run : python model/mpnn.py   (self-test)
++"""
++
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++from torch_geometric.nn import global_mean_pool
++
++
++class EdgeGatedMPNNLayer(nn.Module):
++    """
++    One message passing layer with edge-gated attention.
++
++    For each node i:
++      1. Compute a message from each neighbour j using node + edge features.
++      2. Compute an attention gate (0-1) for each neighbour j.
++      3. Aggregate: weighted sum of messages using gates as weights.
++      4. Update node embedding with a GRU-style residual.
++      5. Apply layer norm.
++
++    This teaches the agent WHICH contacts matter (gate) and HOW they
++    influence the node (message) — much richer than plain mean pooling.
++    """
++
++    def __init__(self, node_dim: int, edge_dim: int):
++        super().__init__()
++        self.node_dim = node_dim
++
++        # Message network: neighbour node + edge → message vector
++        self.message_net = nn.Sequential(
++            nn.Linear(node_dim + edge_dim, node_dim),
++            nn.GELU(),
++            nn.Linear(node_dim, node_dim),
++        )
++
++        # Gate network: neighbour node + edge → scalar attention weight
++        self.gate_net = nn.Sequential(
++            nn.Linear(node_dim + edge_dim, node_dim),
++            nn.GELU(),
++            nn.Linear(node_dim, 1),
++            nn.Sigmoid(),
++        )
++
++        # Update: combine aggregated message with current node embedding
++        self.update_net = nn.Sequential(
++            nn.Linear(node_dim * 2, node_dim),
++            nn.GELU(),
++            nn.Linear(node_dim, node_dim),
++        )
++
++        # Layer norm applied after update (keeps activations stable
++        # across proteins with very different numbers of residues)
++        self.norm = nn.LayerNorm(node_dim)
++
++    def forward(self, x: torch.Tensor,
++                edge_index: torch.Tensor,
++                edge_attr: torch.Tensor) -> torch.Tensor:
++        """
++        Parameters
++        ----------
++        x          : [N, node_dim]  node embeddings
++        edge_index : [2, E]         source / destination indices
++        edge_attr  : [E, edge_dim]  edge features
++
++        Returns
++        -------
++        x_new : [N, node_dim]  updated node embeddings
++        """
++        src, dst = edge_index   # src→dst direction
++
++        # ── Messages ─────────────────────────────────────────
++        # Each edge carries: source node embedding + edge features
++        src_feats = x[src]                          # [E, node_dim]
++        edge_input = torch.cat([src_feats,
++                                edge_attr], dim=-1) # [E, node_dim+edge_dim]
++
++        messages = self.message_net(edge_input)     # [E, node_dim]
++        gates    = self.gate_net(edge_input)        # [E, 1]
++
++        # Gated messages
++        gated_messages = messages * gates           # [E, node_dim]
++
++        # ── Aggregation (sum over incoming edges per node) ────
++        aggregated = torch.zeros_like(x)            # [N, node_dim]
++        aggregated.scatter_add_(
++            0,
++            dst.unsqueeze(-1).expand_as(gated_messages),
++            gated_messages,
++        )
++
++        # ── Update with residual ──────────────────────────────
++        combined = torch.cat([x, aggregated], dim=-1)   # [N, node_dim*2]
++        update   = self.update_net(combined)            # [N, node_dim]
++
++        # Residual connection + layer norm
++        x_new = self.norm(x + update)
++
++        return x_new
++
++
++class MPNNStack(nn.Module):
++    """
++    Stack of EdgeGatedMPNNLayers followed by global pooling.
++
++    Produces a single fixed-size graph embedding regardless of
++    how many residues the protein has — essential for the policy
++    head which must output a fixed action_dim.
++
++    Output projection: node_dim (128) → 256 for policy + value heads.
++    This matches the v1 interface exactly.
++    """
++
++    def __init__(self, node_dim: int = 128,
++                 edge_dim: int = 64,
++                 n_layers: int = 4):
++        super().__init__()
++        self.node_dim = node_dim
++
++        # Stack of message passing layers
++        self.layers = nn.ModuleList([
++            EdgeGatedMPNNLayer(node_dim=node_dim, edge_dim=edge_dim)
++            for _ in range(n_layers)
++        ])
++
++        # Project pooled embedding to 256-dim
++        # (matches v1 output — gnn_policy.py unchanged)
++        self.output_proj = nn.Sequential(
++            nn.Linear(node_dim, 256),
++            nn.GELU(),
++        )
++
++    def forward(self, x: torch.Tensor,
++                edge_index: torch.Tensor,
++                edge_attr: torch.Tensor,
++                batch: torch.Tensor = None) -> torch.Tensor:
++        """
++        Parameters
++        ----------
++        x          : [N, node_dim]   node embeddings from NodeEncoder
++        edge_index : [2, E]          graph connectivity
++        edge_attr  : [E, edge_dim]   edge embeddings from EdgeEncoder
++        batch      : [N]             batch assignment (None = single graph)
++
++        Returns
++        -------
++        global_emb : [1, 256]   graph-level embedding
++        """
++        # Pass through all message passing layers
++        for layer in self.layers:
++            x = layer(x, edge_index, edge_attr)
++
++        # Global mean pooling → one vector per graph
++        if batch is None:
++            # Single graph: mean over all nodes
++            pooled = x.mean(dim=0, keepdim=True)   # [1, node_dim]
++        else:
++            pooled = global_mean_pool(x, batch)    # [B, node_dim]
++
++        # Project to 256
++        global_emb = self.output_proj(pooled)      # [1, 256]
++
++        return global_emb
++
++
++# ── Self-test ─────────────────────────────────────────────────
++
++if __name__ == "__main__":
++    import os, sys
++    sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++    from env.fold_env import FoldEnv
++
++    print("=" * 52)
++    print("ProteinFold-RL — MPNN v2 Self-Test")
++    print("=" * 52)
++
++    NODE_DIM = 128
++    EDGE_DIM = 64
++    N_LAYERS = 4
++
++    env    = FoldEnv(pdb_id="1L2Y")
++    obs, _ = env.reset()
++    graph  = env.get_graph()
++
++    N = graph.x.shape[0]
++    E = graph.edge_index.shape[1]
++    print(f"\n  Graph: {N} nodes, {E} edges")
++
++    # ── Layer test ────────────────────────────────────────────
++    print("\n[TEST 1] EdgeGatedMPNNLayer forward pass...")
++    layer = EdgeGatedMPNNLayer(node_dim=NODE_DIM, edge_dim=EDGE_DIM)
++
++    x_fake    = torch.randn(N, NODE_DIM)
++    ea_fake   = torch.randn(E, EDGE_DIM)
++    x_out     = layer(x_fake, graph.edge_index, ea_fake)
++
++    assert x_out.shape == (N, NODE_DIM), \
++        f"Expected ({N}, {NODE_DIM}), got {x_out.shape}"
++    assert not torch.isnan(x_out).any(), "NaN in layer output"
++    print(f"  Output shape : {x_out.shape}  ✅")
++
++    # ── Stack test ────────────────────────────────────────────
++    print("\n[TEST 2] MPNNStack forward pass...")
++    stack  = MPNNStack(node_dim=NODE_DIM, edge_dim=EDGE_DIM, n_layers=N_LAYERS)
++    x_fake = torch.randn(N, NODE_DIM)
++    ea_fake= torch.randn(E, EDGE_DIM)
++
++    emb = stack(x_fake, graph.edge_index, ea_fake, batch=None)
++    assert emb.shape == (1, 256), \
++        f"Expected (1, 256), got {emb.shape}"
++    assert not torch.isnan(emb).any(), "NaN in stack output"
++    print(f"  Output shape : {emb.shape}  ✅")
++
++    # ── Residual check ────────────────────────────────────────
++    print("\n[TEST 3] Residual connection (output != input)...")
++    assert not torch.allclose(x_fake, x_out), \
++        "Layer output should differ from input"
++    print("  Residual active  ✅")
++
++    # ── Gradient flow ─────────────────────────────────────────
++    print("\n[TEST 4] Gradient flow through all 4 layers...")
++    x_grad  = torch.randn(N, NODE_DIM, requires_grad=True)
++    ea_grad = torch.randn(E, EDGE_DIM)
++    emb_g   = stack(x_grad, graph.edge_index, ea_grad)
++    loss    = emb_g.sum()
++    loss.backward()
++    assert x_grad.grad is not None, "No gradient reached input"
++    assert not torch.isnan(x_grad.grad).any(), "NaN in gradients"
++    print("  Gradients flow cleanly  ✅")
++
++    # ── Parameter count ───────────────────────────────────────
++    n_params = sum(p.numel() for p in stack.parameters())
++    print(f"\n  Parameters : {n_params:,}")
++
++    print("\n" + "=" * 52)
++    print("MPNN v2 — all tests passed ✅")
++    print("Next: python model/gnn_policy.py  (verify full network)")
++    print("=" * 52)
+\ No newline at end of file
+Index: config.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/config.py b/config.py
+--- a/config.py	(revision 71456e9b6125c185e2860ce677a90484ef9d4150)
++++ b/config.py	(date 1777138933252)
+@@ -1,0 +1,25 @@
++"""
++config.py
++ProteinFold-RL — Shared Configuration
++
++Single source of truth for constants used across multiple files.
++Import from here instead of hardcoding values in each file.
++
++Usage
++-----
++  from config import MAX_ACTION_DIM, CHECKPOINT_PATH
++"""
++
++import os
++
++# ── Action space ──────────────────────────────────────────────
++# Largest protein in curriculum is 2HHB: 141 residues
++# Action dim = n_residues × 2 angles × 12 increments
++# All files (train.py, eval.py, gradio_app.py) must use this value
++# so checkpoints load without size mismatch errors.
++MAX_ACTION_DIM = 141 * 2 * 12   # 3384
++
++# ── Paths ─────────────────────────────────────────────────────
++CHECKPOINT_DIR  = "checkpoints"
++CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "policy_final.pt")
++LOG_DIR         = "logs"
+\ No newline at end of file
+Index: model/gnn_policy.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/model/gnn_policy.py b/model/gnn_policy.py
+--- a/model/gnn_policy.py	(revision 71456e9b6125c185e2860ce677a90484ef9d4150)
++++ b/model/gnn_policy.py	(date 1777138887088)
+@@ -1,0 +1,180 @@
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++from torch_geometric.data import Data
++import os, sys
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from model.features import NodeEncoder, EdgeEncoder
++from model.mpnn import MPNNStack
++
++
++class GNNPolicyNetwork(nn.Module):
++    """
++    Full GNN Policy + Value Network for ProteinFold-RL.
++
++    Architecture:
++        NodeEncoder  → 128-dim node embeddings
++        EdgeEncoder  → 64-dim edge embeddings
++        MPNNStack    → 4 message passing layers → 256-dim global embedding
++        Policy head  → Linear(256, action_dim) → action logits
++        Value head   → MLP(256, 128, 1)        → scalar state value
++
++    Input  : PyG Data object (current protein graph)
++    Output : (action_logits [action_dim], state_value [1])
++    """
++
++    def __init__(self, action_dim: int,
++                 node_input_dim: int = 23,
++                 edge_input_dim: int = 4,
++                 hidden_dim: int = 128,
++                 edge_dim: int = 64,
++                 n_layers: int = 4):
++        super().__init__()
++
++        self.action_dim = action_dim
++
++        # Encoders
++        self.node_encoder = NodeEncoder(
++            input_dim=node_input_dim, hidden_dim=hidden_dim
++        )
++        self.edge_encoder = EdgeEncoder(
++            input_dim=edge_input_dim, edge_dim=edge_dim
++        )
++
++        # Message passing
++        self.mpnn = MPNNStack(
++            node_dim=hidden_dim, edge_dim=edge_dim, n_layers=n_layers
++        )
++
++        # Policy head
++        self.policy_head = nn.Linear(256, action_dim)
++
++        # Value head
++        self.value_head = nn.Sequential(
++            nn.Linear(256, 128),
++            nn.GELU(),
++            nn.Linear(128, 1)
++        )
++
++        # Weight initialization
++        self._init_weights()
++
++    def _init_weights(self):
++        for m in self.modules():
++            if isinstance(m, nn.Linear):
++                nn.init.orthogonal_(m.weight, gain=0.01)
++                nn.init.zeros_(m.bias)
++
++    def forward(self, graph: Data):
++        """
++        Args:
++            graph : PyG Data with x [N,23], edge_index [2,E],
++                    edge_attr [E,4], optional batch [N]
++        Returns:
++            logits : [1, action_dim]  action logits
++            value  : [1, 1]           state value estimate
++        """
++        x         = self.node_encoder(graph.x)
++        edge_attr = self.edge_encoder(graph.edge_attr)
++        batch     = graph.batch if hasattr(graph, 'batch') else None
++
++        global_emb = self.mpnn(x, graph.edge_index, edge_attr, batch)
++
++        logits = self.policy_head(global_emb)   # [1, action_dim]
++        value  = self.value_head(global_emb)    # [1, 1]
++
++        return logits, value
++
++    def get_action(self, graph: Data, deterministic: bool = False):
++        """
++        Sample action from policy.
++
++        Returns:
++            action   : int
++            log_prob : torch.Tensor scalar
++            value    : torch.Tensor scalar
++            entropy  : torch.Tensor scalar
++        """
++        logits, value = self.forward(graph)
++        dist = torch.distributions.Categorical(logits=logits.squeeze(0))
++
++        if deterministic:
++            action = logits.argmax(dim=-1).item()
++        else:
++            action = dist.sample().item()
++
++        log_prob = dist.log_prob(torch.tensor(action))
++        entropy  = dist.entropy()
++
++        return action, log_prob, value.squeeze(), entropy
++
++    def evaluate_actions(self, graphs: list, actions: torch.Tensor):
++        """
++        Evaluate a batch of (graph, action) pairs for PPO update.
++
++        Args:
++            graphs  : list of PyG Data objects
++            actions : [T] tensor of action indices
++
++        Returns:
++            log_probs : [T]
++            values    : [T]
++            entropy   : scalar
++        """
++        log_probs, values, entropies = [], [], []
++
++        for i, graph in enumerate(graphs):
++            logits, value = self.forward(graph)
++            dist = torch.distributions.Categorical(
++                logits=logits.squeeze(0)
++            )
++            log_probs.append(dist.log_prob(actions[i]))
++            values.append(value.squeeze())
++            entropies.append(dist.entropy())
++
++        return (
++            torch.stack(log_probs),
++            torch.stack(values),
++            torch.stack(entropies).mean()
++        )
++
++
++if __name__ == "__main__":
++    import os, sys
++    sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++    from env.protein_graph import pdb_to_graph
++    from env.fold_env import FoldEnv
++
++    print("=" * 50)
++    print("ProteinFold-RL — GNN Policy Network Test")
++    print("=" * 50)
++
++    # Build env to get action_dim
++    env    = FoldEnv(pdb_id="1L2Y")
++    obs, _ = env.reset()
++
++    policy = GNNPolicyNetwork(action_dim=env.action_dim)
++    graph  = env.get_graph()
++
++    # Forward pass
++    logits, value = policy(graph)
++    print(f"\n  Action dim     : {env.action_dim}")
++    print(f"  Logits shape   : {logits.shape}")
++    print(f"  Value shape    : {value.shape}")
++    assert logits.shape == (1, env.action_dim), "Logits shape wrong"
++    assert value.shape  == (1, 1),              "Value shape wrong"
++    print(f"  [PASS] Forward pass ✓")
++
++    # Action sampling
++    action, log_prob, val, entropy = policy.get_action(graph)
++    print(f"\n  Sampled action : {action}")
++    print(f"  Log prob       : {log_prob.item():.4f}")
++    print(f"  Value estimate : {val.item():.4f}")
++    print(f"  Entropy        : {entropy.item():.4f}")
++    assert 0 <= action < env.action_dim, "Action out of range"
++    print(f"  [PASS] Action sampling ✓")
++
++    print(f"\n{'=' * 50}")
++    print("CHECKPOINT-03 — GNN policy ready.")
++    print("=" * 50)
+\ No newline at end of file
+Index: model/features.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/model/features.py b/model/features.py
+--- a/model/features.py	(revision 71456e9b6125c185e2860ce677a90484ef9d4150)
++++ b/model/features.py	(date 1777138869272)
+@@ -1,0 +1,204 @@
++"""
++model/features.py
++ProteinFold-RL — Feature Encoders (v2)
++
++What changed vs v1
++------------------
++NodeEncoder:
++  - Amino acid type (20-dim one-hot) and Cα coordinates (3-dim) are
++    encoded separately then merged. They carry completely different
++    information and should not be mixed in the first linear layer.
++  - Layer norm on the final output — stabilises training across
++    proteins with different numbers of residues.
++
++EdgeEncoder:
++  - Layer norm on the final output — edge distances vary across
++    proteins of different sizes (small vs large contact maps).
++
++Interface is identical to v1 — gnn_policy.py needs zero changes.
++
++  NodeEncoder(input_dim=23, hidden_dim=128)
++  EdgeEncoder(input_dim=4,  edge_dim=64)
++
++Run : python model/features.py
++"""
++
++import torch
++import torch.nn as nn
++
++
++class NodeEncoder(nn.Module):
++    """
++    Encodes raw node features into 128-dim node embeddings.
++
++    Input  : [N, 23]  — 20-dim AA one-hot + 3-dim Cα coords
++    Output : [N, hidden_dim]
++
++    AA type and coordinates are encoded in separate branches
++    then concatenated and projected to hidden_dim.
++    This avoids the first linear layer trying to mix two
++    fundamentally different feature types.
++    """
++
++    AA_DIM    = 20   # one-hot amino acid type
++    COORD_DIM = 3    # Cα x, y, z
++
++    def __init__(self, input_dim: int = 23, hidden_dim: int = 128):
++        super().__init__()
++
++        assert input_dim == self.AA_DIM + self.COORD_DIM, \
++            f"input_dim must be {self.AA_DIM + self.COORD_DIM}, got {input_dim}"
++
++        # Branch 1 — amino acid type
++        aa_hidden = hidden_dim // 2   # 64
++        self.aa_branch = nn.Sequential(
++            nn.Linear(self.AA_DIM, aa_hidden),
++            nn.GELU(),
++            nn.Linear(aa_hidden, aa_hidden),
++            nn.GELU(),
++        )
++
++        # Branch 2 — Cα coordinates
++        coord_hidden = hidden_dim // 2   # 64
++        self.coord_branch = nn.Sequential(
++            nn.Linear(self.COORD_DIM, coord_hidden),
++            nn.GELU(),
++            nn.Linear(coord_hidden, coord_hidden),
++            nn.GELU(),
++        )
++
++        # Merge: concat both branches → project to hidden_dim
++        self.merge = nn.Sequential(
++            nn.Linear(aa_hidden + coord_hidden, hidden_dim),
++            nn.GELU(),
++        )
++
++        # Layer norm — stabilises across proteins of different sizes
++        self.norm = nn.LayerNorm(hidden_dim)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        """
++        Parameters
++        ----------
++        x : [N, 23]  raw node features
++
++        Returns
++        -------
++        [N, hidden_dim]  encoded node embeddings
++        """
++        aa_feat    = x[:, :self.AA_DIM]      # [N, 20]
++        coord_feat = x[:, self.AA_DIM:]      # [N, 3]
++
++        aa_emb    = self.aa_branch(aa_feat)       # [N, 64]
++        coord_emb = self.coord_branch(coord_feat) # [N, 64]
++
++        merged = torch.cat([aa_emb, coord_emb], dim=-1)  # [N, 128]
++        out    = self.merge(merged)                       # [N, hidden_dim]
++        return self.norm(out)
++
++
++class EdgeEncoder(nn.Module):
++    """
++    Encodes raw edge features into 64-dim edge embeddings.
++
++    Input  : [E, 4]  — distance + dx + dy + peptide_flag
++    Output : [E, edge_dim]
++
++    Layer norm added to stabilise distances across proteins
++    of very different sizes (small vs large contact maps).
++    """
++
++    def __init__(self, input_dim: int = 4, edge_dim: int = 64):
++        super().__init__()
++
++        self.encoder = nn.Sequential(
++            nn.Linear(input_dim, edge_dim),
++            nn.GELU(),
++            nn.Linear(edge_dim, edge_dim),
++            nn.GELU(),
++        )
++
++        # Layer norm — edge distances vary across protein sizes
++        self.norm = nn.LayerNorm(edge_dim)
++
++    def forward(self, edge_attr: torch.Tensor) -> torch.Tensor:
++        """
++        Parameters
++        ----------
++        edge_attr : [E, 4]  raw edge features
++
++        Returns
++        -------
++        [E, edge_dim]  encoded edge embeddings
++        """
++        return self.norm(self.encoder(edge_attr))
++
++
++# ── Self-test ─────────────────────────────────────────────────
++
++if __name__ == "__main__":
++    print("=" * 52)
++    print("ProteinFold-RL — Feature Encoders v2 Test")
++    print("=" * 52)
++
++    N, E = 20, 146   # 1L2Y: 20 nodes, ~146 edges
++
++    x         = torch.randn(N, 23)
++    edge_attr = torch.randn(E, 4)
++
++    node_enc = NodeEncoder(input_dim=23, hidden_dim=128)
++    edge_enc = EdgeEncoder(input_dim=4,  edge_dim=64)
++
++    # ── Shape tests ───────────────────────────────────────────
++    print("\n[TEST 1] Output shapes...")
++    node_out = node_enc(x)
++    edge_out = edge_enc(edge_attr)
++
++    assert node_out.shape == (N, 128), \
++        f"Node encoder: expected ({N}, 128), got {node_out.shape}"
++    assert edge_out.shape == (E, 64), \
++        f"Edge encoder: expected ({E}, 64), got {edge_out.shape}"
++    print(f"  Node: {x.shape} → {node_out.shape}  ✅")
++    print(f"  Edge: {edge_attr.shape} → {edge_out.shape}  ✅")
++
++    # ── NaN check ─────────────────────────────────────────────
++    print("\n[TEST 2] No NaN in outputs...")
++    assert not torch.isnan(node_out).any(), "NaN in node encoder output"
++    assert not torch.isnan(edge_out).any(), "NaN in edge encoder output"
++    print("  No NaN  ✅")
++
++    # ── Branch separation check ───────────────────────────────
++    print("\n[TEST 3] AA and coord branches are separate...")
++    x2 = x.clone()
++    x2[:, :20] = torch.zeros(N, 20)   # zero out AA features
++    out_no_aa = node_enc(x2)
++    assert not torch.allclose(node_out, out_no_aa), \
++        "AA branch has no effect — check split"
++    print("  AA branch active  ✅")
++
++    x3 = x.clone()
++    x3[:, 20:] = torch.zeros(N, 3)    # zero out coord features
++    out_no_coord = node_enc(x3)
++    assert not torch.allclose(node_out, out_no_coord), \
++        "Coord branch has no effect — check split"
++    print("  Coord branch active  ✅")
++
++    # ── Gradient flow ─────────────────────────────────────────
++    print("\n[TEST 4] Gradient flow...")
++    x_g = torch.randn(N, 23, requires_grad=True)
++    out = node_enc(x_g)
++    out.sum().backward()
++    assert x_g.grad is not None, "No gradient reached node input"
++    assert not torch.isnan(x_g.grad).any(), "NaN in gradients"
++    print("  Gradients flow cleanly  ✅")
++
++    # ── Parameter count ───────────────────────────────────────
++    n_node = sum(p.numel() for p in node_enc.parameters())
++    n_edge = sum(p.numel() for p in edge_enc.parameters())
++    print(f"\n  NodeEncoder params : {n_node:,}")
++    print(f"  EdgeEncoder params : {n_edge:,}")
++
++    print("\n" + "=" * 52)
++    print("Feature encoders v2 — all tests passed ✅")
++    print("Next: python model/gnn_policy.py")
++    print("=" * 52)
+\ No newline at end of file
+Index: api/routes/fold.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.BaseRevisionTextPatchEP
+<+>\"\"\"\r\napi/routes/fold.py\r\nPOST /fold — run the trained agent on a protein.\r\n\r\nThis is the most important endpoint.  It:\r\n  1. Validates the request (Pydantic does this automatically).\r\n  2. Checks the model is loaded.\r\n  3. Gets a fresh FoldEnv for the requested protein.\r\n  4. Calls fold_runner.run_fold() and returns the result.\r\n\r\nAll heavy logic lives in fold_runner.py — this file stays thin.\r\n\r\nAuthor : ProteinFold-RL team\r\n\"\"\"\r\n\r\nfrom __future__ import annotations\r\n\r\nimport logging\r\n\r\nfrom fastapi import APIRouter, HTTPException, status\r\n\r\nfrom api.fold_runner import run_fold\r\nfrom api.model_manager import get_model_manager\r\nfrom api.schemas import FoldRequest, FoldResponse, ErrorResponse\r\n\r\nlogger = logging.getLogger(\"proteinfold.routes.fold\")\r\nrouter = APIRouter(tags=[\"Folding\"])\r\n\r\n\r\n@router.post(\r\n    \"/fold\",\r\n    response_model=FoldResponse,\r\n    status_code=status.HTTP_200_OK,\r\n    summary=\"Run the folding agent on a protein\",\r\n    description=(\r\n        \"Send a protein (by PDB ID or custom sequence) and the number of \"\r\n        \"agent steps to run. Returns per-step energy/RMSD trajectory, \"\r\n        \"before/after/native PDB strings, and summary metrics.\\n\\n\"\r\n        \"**Supported PDB IDs:** `1L2Y` (Trp-cage, 20 res), \"\r\n        \"`1YRF` (Villin, 35 res).\\n\\n\"\r\n        \"**Custom sequences:** 5–50 residues, standard AA single-letter codes.\"\r\n    ),\r\n    responses={\r\n        400: {\"model\": ErrorResponse, \"description\": \"Bad request (invalid input).\"},\r\n        503: {\"model\": ErrorResponse, \"description\": \"Model not loaded yet.\"},\r\n        500: {\"model\": ErrorResponse, \"description\": \"Internal error during folding.\"},\r\n    },\r\n)\r\ndef fold_protein(request: FoldRequest) -> FoldResponse:\r\n    \"\"\"\r\n    Run the trained PPO agent on the requested protein.\r\n\r\n    - **pdb_id**: `1L2Y` or `1YRF`\r\n    - **sequence**: custom AA string (5–50 residues)\r\n    - **n_steps**: 1–200\r\n    - **deterministic**: greedy action selection if `true`\r\n    \"\"\"\r\n    mm = get_model_manager()\r\n\r\n    # ── Guard: model must be loaded ────────────────────────────\r\n    if not mm.is_loaded:\r\n        raise HTTPException(\r\n            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,\r\n            detail={\r\n                \"detail\": \"Model is still loading. Retry in a few seconds.\",\r\n                \"code\": \"MODEL_NOT_LOADED\",\r\n            },\r\n        )\r\n\r\n    # ── Get protein environment ────────────────────────────────\r\n    pdb_id = request.pdb_id.value if request.pdb_id else None\r\n\r\n    if pdb_id is None:\r\n        # Custom sequence — build env from sequence directly\r\n        from api.fold_runner import build_custom_env\r\n        try:\r\n            env = build_custom_env(request.sequence)\r\n        except Exception as exc:\r\n            raise HTTPException(\r\n                status_code=status.HTTP_400_BAD_REQUEST,\r\n                detail={\r\n                    \"detail\": f\"Failed to build custom sequence env: {exc}\",\r\n                    \"code\": \"CUSTOM_ENV_FAILED\",\r\n                },\r\n            ) from exc\r\n    else:\r\n        try:\r\n            env = mm.get_env(pdb_id)\r\n        except ValueError as exc:\r\n            raise HTTPException(\r\n                status_code=status.HTTP_400_BAD_REQUEST,\r\n                detail={\"detail\": str(exc), \"code\": \"UNKNOWN_PROTEIN\"},\r\n            ) from exc\r\n\r\n    # ── Run agent ──────────────────────────────────────────────\r\n    try:\r\n        result = run_fold(\r\n            request=request,\r\n            policy=mm.policy,\r\n            env=env,\r\n        )\r\n    except Exception as exc:  # noqa: BLE001\r\n        logger.exception(\"[/fold] Unhandled error during fold: %s\", exc)\r\n        raise HTTPException(\r\n            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,\r\n            detail={\r\n                \"detail\": f\"Folding failed: {exc}\",\r\n                \"code\": \"FOLD_FAILED\",\r\n            },\r\n        ) from exc\r\n\r\n    return result\r\n
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/api/routes/fold.py b/api/routes/fold.py
+--- a/api/routes/fold.py	(revision 71456e9b6125c185e2860ce677a90484ef9d4150)
++++ b/api/routes/fold.py	(date 1777147402396)
+@@ -1,112 +1,0 @@
+-"""
+-api/routes/fold.py
+-POST /fold — run the trained agent on a protein.
+-
+-This is the most important endpoint.  It:
+-  1. Validates the request (Pydantic does this automatically).
+-  2. Checks the model is loaded.
+-  3. Gets a fresh FoldEnv for the requested protein.
+-  4. Calls fold_runner.run_fold() and returns the result.
+-
+-All heavy logic lives in fold_runner.py — this file stays thin.
+-
+-Author : ProteinFold-RL team
+-"""
+-
+-from __future__ import annotations
+-
+-import logging
+-
+-from fastapi import APIRouter, HTTPException, status
+-
+-from api.fold_runner import run_fold
+-from api.model_manager import get_model_manager
+-from api.schemas import FoldRequest, FoldResponse, ErrorResponse
+-
+-logger = logging.getLogger("proteinfold.routes.fold")
+-router = APIRouter(tags=["Folding"])
+-
+-
+-@router.post(
+-    "/fold",
+-    response_model=FoldResponse,
+-    status_code=status.HTTP_200_OK,
+-    summary="Run the folding agent on a protein",
+-    description=(
+-        "Send a protein (by PDB ID or custom sequence) and the number of "
+-        "agent steps to run. Returns per-step energy/RMSD trajectory, "
+-        "before/after/native PDB strings, and summary metrics.\n\n"
+-        "**Supported PDB IDs:** `1L2Y` (Trp-cage, 20 res), "
+-        "`1YRF` (Villin, 35 res).\n\n"
+-        "**Custom sequences:** 5–50 residues, standard AA single-letter codes."
+-    ),
+-    responses={
+-        400: {"model": ErrorResponse, "description": "Bad request (invalid input)."},
+-        503: {"model": ErrorResponse, "description": "Model not loaded yet."},
+-        500: {"model": ErrorResponse, "description": "Internal error during folding."},
+-    },
+-)
+-def fold_protein(request: FoldRequest) -> FoldResponse:
+-    """
+-    Run the trained PPO agent on the requested protein.
+-
+-    - **pdb_id**: `1L2Y` or `1YRF`
+-    - **sequence**: custom AA string (5–50 residues)
+-    - **n_steps**: 1–200
+-    - **deterministic**: greedy action selection if `true`
+-    """
+-    mm = get_model_manager()
+-
+-    # ── Guard: model must be loaded ────────────────────────────
+-    if not mm.is_loaded:
+-        raise HTTPException(
+-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+-            detail={
+-                "detail": "Model is still loading. Retry in a few seconds.",
+-                "code": "MODEL_NOT_LOADED",
+-            },
+-        )
+-
+-    # ── Get protein environment ────────────────────────────────
+-    pdb_id = request.pdb_id.value if request.pdb_id else None
+-
+-    if pdb_id is None:
+-        # Custom sequence — build env from sequence directly
+-        from api.fold_runner import build_custom_env
+-        try:
+-            env = build_custom_env(request.sequence)
+-        except Exception as exc:
+-            raise HTTPException(
+-                status_code=status.HTTP_400_BAD_REQUEST,
+-                detail={
+-                    "detail": f"Failed to build custom sequence env: {exc}",
+-                    "code": "CUSTOM_ENV_FAILED",
+-                },
+-            ) from exc
+-    else:
+-        try:
+-            env = mm.get_env(pdb_id)
+-        except ValueError as exc:
+-            raise HTTPException(
+-                status_code=status.HTTP_400_BAD_REQUEST,
+-                detail={"detail": str(exc), "code": "UNKNOWN_PROTEIN"},
+-            ) from exc
+-
+-    # ── Run agent ──────────────────────────────────────────────
+-    try:
+-        result = run_fold(
+-            request=request,
+-            policy=mm.policy,
+-            env=env,
+-        )
+-    except Exception as exc:  # noqa: BLE001
+-        logger.exception("[/fold] Unhandled error during fold: %s", exc)
+-        raise HTTPException(
+-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+-            detail={
+-                "detail": f"Folding failed: {exc}",
+-                "code": "FOLD_FAILED",
+-            },
+-        ) from exc
+-
+-    return result
+Index: data/protein_registry.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/data/protein_registry.py b/data/protein_registry.py
+--- a/data/protein_registry.py	(revision 71456e9b6125c185e2860ce677a90484ef9d4150)
++++ b/data/protein_registry.py	(date 1777138710637)
+@@ -1,0 +1,285 @@
++"""
++data/protein_registry.py
++ProteinFold-RL — Protein Registry
++
++Single source of truth for every protein in the curriculum.
++Defines what proteins exist, their metadata, and where they live on disk.
++Does NOT download. Does NOT train. Does NOT advance curriculum.
++Those are separate files with separate jobs.
++
++8 proteins across 4 stages — hybrid curriculum:
++  Stage 1 — tiny, helix-only          (warmup, agent builds intuition)
++  Stage 2 — small, introduces sheets  (generalization begins)
++  Stage 3 — medium, mixed topology    (real challenge)
++  Stage 4 — larger, mastery test      (proves the agent learned physics)
++
++File location : data/protein_registry.py
++Run directly  : python data/protein_registry.py  (self-test + print table)
++"""
++
++import os
++from dataclasses import dataclass
++from typing import List, Dict
++
++# ── Path to PDB files — must match fold_env.PDB_PATHS pattern ─
++STRUCTURES_DIR = os.path.join(os.path.dirname(__file__), "structures")
++
++# ── RCSB download template ────────────────────────────────────
++RCSB_URL = "https://files.rcsb.org/download/{pdb_id}.pdb"
++
++
++@dataclass(frozen=True)
++class ProteinEntry:
++    """
++    Metadata record for one protein.
++
++    Attributes
++    ----------
++    pdb_id          : 4-char RCSB identifier  e.g. "1L2Y"
++    name            : human-readable name
++    n_residues      : number of Cα residues
++    ss_type         : dominant secondary structure
++                      "helix" | "sheet" | "mixed"
++    curriculum_stage: 1-4 (1 = easiest)
++    difficulty      : 1-4 (finer-grained than stage)
++    rmsd_gate       : rolling-mean RMSD (Å) agent must reach to advance
++    description     : one-line biological note
++    """
++    pdb_id           : str
++    name             : str
++    n_residues       : int
++    ss_type          : str
++    curriculum_stage : int
++    difficulty       : int
++    rmsd_gate        : float
++    description      : str
++
++    @property
++    def url(self) -> str:
++        """Direct RCSB download URL."""
++        return RCSB_URL.format(pdb_id=self.pdb_id)
++
++    @property
++    def local_path(self) -> str:
++        """Absolute path where the PDB file lives on disk."""
++        return os.path.join(STRUCTURES_DIR, f"{self.pdb_id}.pdb")
++
++    @property
++    def is_downloaded(self) -> bool:
++        """True if the PDB file exists on disk."""
++        return os.path.isfile(self.local_path)
++
++
++# ─────────────────────────────────────────────────────────────
++# THE 8-PROTEIN CURRICULUM
++# ─────────────────────────────────────────────────────────────
++#
++# Protein selection rationale
++# ───────────────────────────
++# Stage 1 — Micro proteins, pure helix
++#   1L2Y  Trp-cage (20 res)    — already trained, warmup anchor
++#   1YRF  Villin HP35 (35 res) — 3-helix bundle, fast folder, ideal RL target
++#
++# Stage 2 — Small, introduces beta-sheet
++#   1VII  Villin HP36 (36 res) — same family as 1YRF, different loop geometry
++#   2GB1  Protein G (56 res)   — helix + sheet, classic benchmark
++#
++# Stage 3 — Medium, fully mixed topology
++#   1ENH  Engrailed HD (54 res)  — homeodomain, 3-helix, DNA-binding
++#   1UBQ  Ubiquitin (76 res)     — alpha+beta, universal eukaryotic protein
++#
++# Stage 4 — Larger, mastery challenge
++#   1BDD  Protein A (58 res)     — tight 3-helix packing, high difficulty
++#   2HHB  Hemoglobin α (141 res) — largest in set, disease-relevant
++#
++REGISTRY: List[ProteinEntry] = [
++
++    # ── Stage 1 ──────────────────────────────────────────────
++    ProteinEntry(
++        pdb_id           = "1L2Y",
++        name             = "Trp-cage miniprotein",
++        n_residues       = 20,
++        ss_type          = "helix",
++        curriculum_stage = 1,
++        difficulty       = 1,
++        rmsd_gate        = 3.5,
++        description      = "Smallest known autonomously folding protein. "
++                           "Gold standard for folding benchmarks.",
++    ),
++    ProteinEntry(
++        pdb_id           = "1YRF",
++        name             = "Villin headpiece HP35",
++        n_residues       = 35,
++        ss_type          = "helix",
++        curriculum_stage = 1,
++        difficulty       = 2,
++        rmsd_gate        = 4.5,
++        description      = "Three-helix bundle, microsecond folder. "
++                           "Ideal RL target — fast dynamics, well-studied.",
++    ),
++
++    # ── Stage 2 ──────────────────────────────────────────────
++    ProteinEntry(
++        pdb_id           = "1VII",
++        name             = "Villin headpiece HP36",
++        n_residues       = 36,
++        ss_type          = "helix",
++        curriculum_stage = 2,
++        difficulty       = 2,
++        rmsd_gate        = 4.5,
++        description      = "HP36 variant of Villin. Tests generalization "
++                           "within the same protein family.",
++    ),
++    ProteinEntry(
++        pdb_id           = "2GB1",
++        name             = "Protein G B1 domain",
++        n_residues       = 56,
++        ss_type          = "mixed",
++        curriculum_stage = 2,
++        difficulty       = 3,
++        rmsd_gate        = 5.5,
++        description      = "Mixed helix + sheet. Forces agent to learn "
++                           "both secondary structure types.",
++    ),
++
++    # ── Stage 3 ──────────────────────────────────────────────
++    ProteinEntry(
++        pdb_id           = "1ENH",
++        name             = "Engrailed homeodomain",
++        n_residues       = 54,
++        ss_type          = "helix",
++        curriculum_stage = 3,
++        difficulty       = 3,
++        rmsd_gate        = 5.5,
++        description      = "Drosophila homeodomain, DNA-binding protein. "
++                           "Well-characterized folding pathway.",
++    ),
++    ProteinEntry(
++        pdb_id           = "1UBQ",
++        name             = "Ubiquitin",
++        n_residues       = 76,
++        ss_type          = "mixed",
++        curriculum_stage = 3,
++        difficulty       = 4,
++        rmsd_gate        = 6.5,
++        description      = "76-residue alpha+beta protein, universal in "
++                           "eukaryotes. Central to protein degradation.",
++    ),
++
++    # ── Stage 4 ──────────────────────────────────────────────
++    ProteinEntry(
++        pdb_id           = "1BDD",
++        name             = "Protein A B-domain",
++        n_residues       = 58,
++        ss_type          = "helix",
++        curriculum_stage = 4,
++        difficulty       = 4,
++        rmsd_gate        = 6.0,
++        description      = "Staphylococcal protein A, tight 3-helix packing. "
++                           "High difficulty from constrained geometry.",
++    ),
++    ProteinEntry(
++        pdb_id           = "2HHB",
++        name             = "Hemoglobin alpha chain",
++        n_residues       = 141,
++        ss_type          = "mixed",
++        curriculum_stage = 4,
++        difficulty       = 4,
++        rmsd_gate        = 8.0,
++        description      = "Human hemoglobin alpha chain, 141 residues. "
++                           "Sickle cell disease target. Mastery challenge.",
++    ),
++]
++
++# ─────────────────────────────────────────────────────────────
++# LOOKUP HELPERS
++# ─────────────────────────────────────────────────────────────
++
++# Fast lookup by PDB ID
++BY_ID: Dict[str, ProteinEntry] = {p.pdb_id: p for p in REGISTRY}
++
++# Proteins grouped by curriculum stage
++BY_STAGE: Dict[int, List[ProteinEntry]] = {}
++for _p in REGISTRY:
++    BY_STAGE.setdefault(_p.curriculum_stage, []).append(_p)
++
++
++def get_protein(pdb_id: str) -> ProteinEntry:
++    """Return ProteinEntry by PDB ID. Raises KeyError if unknown."""
++    if pdb_id not in BY_ID:
++        raise KeyError(
++            f"Unknown PDB ID '{pdb_id}'. "
++            f"Available: {list(BY_ID.keys())}"
++        )
++    return BY_ID[pdb_id]
++
++
++def get_stage(stage: int) -> List[ProteinEntry]:
++    """Return all proteins in a given curriculum stage (1-4)."""
++    if stage not in BY_STAGE:
++        raise KeyError(
++            f"Stage {stage} not found. "
++            f"Valid stages: {sorted(BY_STAGE)}"
++        )
++    return BY_STAGE[stage]
++
++
++def all_pdb_ids() -> List[str]:
++    """Return all PDB IDs in curriculum order."""
++    return [p.pdb_id for p in REGISTRY]
++
++
++# ─────────────────────────────────────────────────────────────
++# PRETTY PRINT
++# ─────────────────────────────────────────────────────────────
++
++def print_registry() -> None:
++    """Print the full registry as a formatted table."""
++    div = "─" * 72
++    print("═" * 72)
++    print("  ProteinFold-RL — Protein Registry (8 proteins, 4 stages)")
++    print("═" * 72)
++    print(f"  {'PDB':6} {'Name':28} {'Res':4} {'SS':7} "
++          f"{'Stg':4} {'Dif':4} {'Gate':6}  On disk")
++    print(f"  {div}")
++    for stage in sorted(BY_STAGE):
++        for p in BY_STAGE[stage]:
++            status = "✅" if p.is_downloaded else "⬜  need download"
++            print(
++                f"  {p.pdb_id:6} {p.name:28} {p.n_residues:4d} "
++                f"{p.ss_type:7} {p.curriculum_stage:4d} {p.difficulty:4d} "
++                f"{p.rmsd_gate:6.1f}  {status}"
++            )
++        print(f"  {div}")
++    downloaded = sum(1 for p in REGISTRY if p.is_downloaded)
++    print(f"\n  {downloaded}/{len(REGISTRY)} proteins on disk")
++    print("═" * 72)
++
++
++# ─────────────────────────────────────────────────────────────
++# SELF-TEST  —  python data/protein_registry.py
++# ─────────────────────────────────────────────────────────────
++
++if __name__ == "__main__":
++    print_registry()
++
++    print("\n[TEST] Registry integrity checks...")
++    assert len(REGISTRY) == 8,                        "Must have 8 proteins"
++    assert len(BY_STAGE)  == 4,                        "Must have 4 stages"
++    assert all(p.difficulty in range(1, 5)
++               for p in REGISTRY),                    "Difficulty must be 1-4"
++    assert all(p.curriculum_stage in range(1, 5)
++               for p in REGISTRY),                    "Stage must be 1-4"
++    assert all(p.rmsd_gate > 0
++               for p in REGISTRY),                    "Gate must be positive"
++    assert all(p.pdb_id in p.url
++               for p in REGISTRY),                    "URL must contain PDB ID"
++    assert all(p.pdb_id in p.local_path
++               for p in REGISTRY),                    "Path must contain PDB ID"
++    assert get_protein("1L2Y").curriculum_stage == 1,  "1L2Y must be stage 1"
++    assert get_protein("2HHB").difficulty       == 4,  "2HHB must be difficulty 4"
++    assert get_stage(1)[0].pdb_id == "1L2Y",           "Stage 1 starts with 1L2Y"
++    assert len(get_stage(4)) == 2,                     "Stage 4 has 2 proteins"
++
++    print("  All checks passed ✅")
++    print("\nNext step: python data/download_proteins.py")
+\ No newline at end of file
+Index: frontend/science.html
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.BaseRevisionTextPatchEP
+<+><!DOCTYPE html>\r\n<html lang=\"en\">\r\n<head>\r\n  <meta charset=\"UTF-8\" />\r\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\r\n  <title>ProteinFold-RL — Science</title>\r\n  <link rel=\"stylesheet\" href=\"assets/css/design-system.css\" />\r\n  <style>\r\n\r\n    /* ══════════════════════════════════════════\r\n       PAGE HEADER\r\n    ══════════════════════════════════════════ */\r\n    .sci-header {\r\n      padding: 2.5rem 2.5rem 2rem;\r\n      border-bottom: 0.5px solid var(--border);\r\n      background: var(--bg2);\r\n      display: flex;\r\n      align-items: flex-start;\r\n      justify-content: space-between;\r\n      gap: 2rem;\r\n    }\r\n    .sci-eyebrow {\r\n      font-family: var(--mono);\r\n      font-size: 9px;\r\n      letter-spacing: 0.2em;\r\n      text-transform: uppercase;\r\n      color: rgba(61,159,255,0.4);\r\n      margin-bottom: 0.5rem;\r\n    }\r\n    .sci-title {\r\n      font-size: 1.75rem;\r\n      font-weight: 800;\r\n      color: #eaf4ff;\r\n      letter-spacing: -0.02em;\r\n      line-height: 1.1;\r\n      margin-bottom: 0.5rem;\r\n    }\r\n    .sci-subtitle {\r\n      font-family: var(--mono);\r\n      font-size: 11px;\r\n      color: var(--text-dim);\r\n      letter-spacing: 0.04em;\r\n    }\r\n    .sci-header-right {\r\n      display: flex;\r\n      flex-direction: column;\r\n      align-items: flex-end;\r\n      gap: 6px;\r\n      flex-shrink: 0;\r\n    }\r\n    .sci-tag {\r\n      font-family: var(--mono);\r\n      font-size: 9px;\r\n      padding: 4px 12px;\r\n      border: 0.5px solid var(--border-hi);\r\n      color: var(--text-dim);\r\n      letter-spacing: 0.1em;\r\n      text-transform: uppercase;\r\n    }\r\n\r\n    /* ══════════════════════════════════════════\r\n       SECTION BASE\r\n    ══════════════════════════════════════════ */\r\n    .sci-section {\r\n      padding: 3rem 2.5rem;\r\n      border-bottom: 0.5px solid var(--border);\r\n    }\r\n\r\n    /* ══════════════════════════════════════════\r\n       WHY RL — SPLIT LAYOUT\r\n    ══════════════════════════════════════════ */\r\n    .why-grid {\r\n      display: grid;\r\n      grid-template-columns: 1fr 1fr;\r\n      gap: 2.5rem;\r\n      align-items: start;\r\n    }\r\n    .why-text {}\r\n    .why-heading {\r\n      font-size: 1.3rem;\r\n      font-weight: 800;\r\n      color: #eaf4ff;\r\n      margin-bottom: 1rem;\r\n      letter-spacing: -0.01em;\r\n    }\r\n    .why-para {\r\n      font-family: var(--mono);\r\n      font-size: 11px;\r\n      color: var(--text-dim);\r\n      line-height: 2;\r\n      margin-bottom: 1rem;\r\n    }\r\n    .why-para strong { color: var(--blue); font-weight: 700; }\r\n    .why-para em     { color: var(--teal); font-style: normal; }\r\n\r\n    .why-cards {\r\n      display: flex;\r\n      flex-direction: column;\r\n      gap: 1px;\r\n      background: var(--border);\r\n      border: 0.5px solid var(--border);\r\n    }\r\n    .why-card {\r\n      background: var(--bg2);\r\n      padding: 1.25rem 1.5rem;\r\n      display: flex;\r\n      gap: 1rem;\r\n      align-items: flex-start;\r\n      transition: background 0.15s;\r\n    }\r\n    .why-card:hover { background: var(--bg3); }\r\n    .why-card-icon {\r\n      width: 32px; height: 32px;\r\n      border: 0.5px solid var(--border-hi);\r\n      display: flex;\r\n      align-items: center;\r\n      justify-content: center;\r\n      flex-shrink: 0;\r\n      font-family: var(--mono);\r\n      font-size: 11px;\r\n      color: var(--blue);\r\n      font-weight: 700;\r\n    }\r\n    .why-card-body {}\r\n    .why-card-title {\r\n      font-size: 0.9rem;\r\n      font-weight: 700;\r\n      color: #eaf4ff;\r\n      margin-bottom: 4px;\r\n    }\r\n    .why-card-desc {\r\n      font-family: var(--mono);\r\n      font-size: 10px;\r\n      color: var(--text-dim);\r\n      line-height: 1.8;\r\n    }\r\n\r\n    /* ══════════════════════════════════════════\r\n       RL LOOP DIAGRAM — FULL WIDTH VISUAL\r\n    ══════════════════════════════════════════ */\r\n    .rl-diagram-wrap {\r\n      background: var(--bg2);\r\n      border: 0.5px solid var(--border);\r\n      padding: 2rem;\r\n      overflow-x: auto;\r\n    }\r\n    .rl-diagram-label {\r\n      font-family: var(--mono);\r\n      font-size: 9px;\r\n      letter-spacing: 0.18em;\r\n      text-transform: uppercase;\r\n      color: rgba(61,159,255,0.35);\r\n      margin-bottom: 1.5rem;\r\n    }\r\n\r\n    /* ══════════════════════════════════════════\r\n       GNN ARCHITECTURE — SPLIT\r\n    ══════════════════════════════════════════ */\r\n    .arch-grid {\r\n      display: grid;\r\n      grid-template-columns: 1fr 1fr;\r\n      gap: 2rem;\r\n      align-items: start;\r\n    }\r\n    .arch-visual {\r\n      background: var(--bg2);\r\n      border: 0.5px solid var(--border);\r\n      padding: 1.5rem;\r\n    }\r\n    .arch-text {}\r\n    .arch-heading {\r\n      font-size: 1.2rem;\r\n      font-weight: 800;\r\n      color: #eaf4ff;\r\n      margin-bottom: 0.75rem;\r\n      letter-spacing: -0.01em;\r\n    }\r\n    .arch-para {\r\n      font-family: var(--mono);\r\n      font-size: 11px;\r\n      color: var(--text-dim);\r\n      line-height: 2;\r\n      margin-bottom: 1rem;\r\n    }\r\n    .arch-para strong { color: var(--blue); }\r\n    .arch-para em     { color: var(--teal); font-style: normal; }\r\n\r\n    .arch-table {\r\n      width: 100%;\r\n      border-collapse: collapse;\r\n      font-family: var(--mono);\r\n      font-size: 10px;\r\n      margin-top: 1rem;\r\n    }\r\n    .arch-table tr {\r\n      border-bottom: 0.5px solid var(--border);\r\n    }\r\n    .arch-table tr:last-child { border-bottom: none; }\r\n    .arch-table td {\r\n      padding: 0.6rem 0.75rem;\r\n      color: var(--text-dim);\r\n      vertical-align: top;\r\n    }\r\n    .arch-table td:first-child {\r\n      color: var(--blue);\r\n      font-weight: 700;\r\n      width: 120px;\r\n      letter-spacing: 0.06em;\r\n    }\r\n    .arch-table td:last-child { color: var(--text-mid); }\r\n\r\n    /* ══════════════════════════════════════════\r\n       ENERGY FUNCTION\r\n    ══════════════════════════════════════════ */\r\n    .energy-grid {\r\n      display: grid;\r\n      grid-template-columns: 1fr 1fr;\r\n      gap: 2rem;\r\n      align-items: start;\r\n    }\r\n    .eq-block {\r\n      background: var(--bg2);\r\n      border: 0.5px solid var(--border);\r\n      border-left: 2px solid var(--blue);\r\n      padding: 1.25rem 1.5rem;\r\n      margin-bottom: 1rem;\r\n    }\r\n    .eq-label {\r\n      font-family: var(--mono);\r\n      font-size: 9px;\r\n      letter-spacing: 0.14em;\r\n      text-transform: uppercase;\r\n      color: var(--text-dim);\r\n      margin-bottom: 0.6rem;\r\n    }\r\n    .eq-formula {\r\n      font-family: var(--mono);\r\n      font-size: 13px;\r\n      color: var(--blue);\r\n      font-weight: 700;\r\n      letter-spacing: 0.04em;\r\n      margin-bottom: 0.5rem;\r\n      line-height: 1.6;\r\n    }\r\n    .eq-desc {\r\n      font-family: var(--mono);\r\n      font-size: 10px;\r\n      color: var(--text-dim);\r\n      line-height: 1.8;\r\n    }\r\n    .eq-desc span { color: var(--teal); }\r\n\r\n    /* ══════════════════════════════════════════\r\n       REWARD TABLE\r\n    ══════════════════════════════════════════ */\r\n    .reward-grid {\r\n      display: grid;\r\n      grid-template-columns: 1fr 1fr;\r\n      gap: 2rem;\r\n      align-items: start;\r\n    }\r\n    .reward-table-wrap {\r\n      background: var(--bg2);\r\n      border: 0.5px solid var(--border);\r\n    }\r\n    .reward-table-header {\r\n      padding: 0.75rem 1.25rem;\r\n      border-bottom: 0.5px solid var(--border);\r\n      font-family: var(--mono);\r\n      font-size: 9px;\r\n      letter-spacing: 0.14em;\r\n      text-transform: uppercase;\r\n      color: var(--text-dim);\r\n    }\r\n    .reward-row {\r\n      display: flex;\r\n      align-items: center;\r\n      justify-content: space-between;\r\n      padding: 0.7rem 1.25rem;\r\n      border-bottom: 0.5px solid var(--border);\r\n      gap: 12px;\r\n    }\r\n    .reward-row:last-child { border-bottom: none; }\r\n    .rr-condition {\r\n      font-family: var(--mono);\r\n      font-size: 10px;\r\n      color: var(--text-dim);\r\n      flex: 1;\r\n    }\r\n    .rr-val {\r\n      font-family: var(--mono);\r\n      font-size: 12px;\r\n      font-weight: 700;\r\n      width: 60px;\r\n      text-align: right;\r\n      flex-shrink: 0;\r\n    }\r\n    .rr-bar {\r\n      width: 80px;\r\n      height: 4px;\r\n      background: rgba(61,159,255,0.08);\r\n      flex-shrink: 0;\r\n      position: relative;\r\n    }\r\n    .rr-bar-fill {\r\n      position: absolute;\r\n      top: 0; bottom: 0;\r\n      left: 0;\r\n      width: var(--w);\r\n      background: var(--c);\r\n    }\r\n\r\n    /* ══════════════════════════════════════════\r\n       PPO SECTION\r\n    ══════════════════════════════════════════ */\r\n    .ppo-grid {\r\n      display: grid;\r\n      grid-template-columns: 1fr 1fr;\r\n      gap: 2rem;\r\n      align-items: start;\r\n    }\r\n    .ppo-params {\r\n      display: flex;\r\n      flex-direction: column;\r\n      gap: 1px;\r\n      background: var(--border);\r\n      border: 0.5px solid var(--border);\r\n    }\r\n    .ppo-param-row {\r\n      display: flex;\r\n      align-items: center;\r\n      justify-content: space-between;\r\n      padding: 0.65rem 1.25rem;\r\n      background: var(--bg2);\r\n      gap: 12px;\r\n    }\r\n    .pp-key {\r\n      font-family: var(--mono);\r\n      font-size: 10px;\r\n      color: var(--text-dim);\r\n      letter-spacing: 0.08em;\r\n    }\r\n    .pp-val {\r\n      font-family: var(--mono);\r\n      font-size: 11px;\r\n      font-weight: 700;\r\n      color: var(--blue);\r\n    }\r\n    .pp-desc {\r\n      font-family: var(--mono);\r\n      font-size: 9px;\r\n      color: var(--text-dim);\r\n      text-align: right;\r\n    }\r\n\r\n    /* ══════════════════════════════════════════\r\n       SCIENTIFIC JUSTIFICATION CARDS\r\n    ══════════════════════════════════════════ */\r\n    .justify-grid {\r\n      display: grid;\r\n      grid-template-columns: repeat(3, 1fr);\r\n      gap: 1px;\r\n      background: var(--border);\r\n      border: 0.5px solid var(--border);\r\n    }\r\n    .justify-card {\r\n      background: var(--bg2);\r\n      padding: 1.75rem 1.5rem;\r\n      position: relative;\r\n      overflow: hidden;\r\n    }\r\n    .justify-card::before {\r\n      content: '';\r\n      position: absolute;\r\n      top: 0; left: 0; right: 0;\r\n      height: 2px;\r\n      background: var(--ac);\r\n    }\r\n    .justify-num {\r\n      font-family: var(--mono);\r\n      font-size: 2rem;\r\n      font-weight: 800;\r\n      color: rgba(61,159,255,0.12);\r\n      line-height: 1;\r\n      margin-bottom: 0.75rem;\r\n    }\r\n    .justify-title {\r\n      font-size: 0.95rem;\r\n      font-weight: 700;\r\n      color: #eaf4ff;\r\n      margin-bottom: 0.6rem;\r\n    }\r\n    .justify-body {\r\n      font-family: var(--mono);\r\n      font-size: 10px;\r\n      color: var(--text-dim);\r\n      line-height: 1.9;\r\n    }\r\n    .justify-body strong { color: var(--blue); }\r\n\r\n    /* ══════════════════════════════════════════\r\n       RESPONSIVE\r\n    ══════════════════════════════════════════ */\r\n    @media (max-width: 900px) {\r\n      .why-grid     { grid-template-columns: 1fr; }\r\n      .arch-grid    { grid-template-columns: 1fr; }\r\n      .energy-grid  { grid-template-columns: 1fr; }\r\n      .reward-grid  { grid-template-columns: 1fr; }\r\n      .ppo-grid     { grid-template-columns: 1fr; }\r\n      .justify-grid { grid-template-columns: 1fr; }\r\n      .sci-header   { flex-direction: column; }\r\n      .sci-section  { padding: 2rem 1.5rem; }\r\n    }\r\n  </style>\r\n</head>\r\n<body>\r\n\r\n<canvas id=\"stars-canvas\"></canvas>\r\n\r\n<div class=\"page\">\r\n\r\n  <!-- ══ NAV ══ -->\r\n  <nav class=\"nav\">\r\n    <a class=\"nav-logo\" href=\"index.html\">\r\n      <div class=\"nav-logo-dot\"></div>\r\n      PROTEINFOLD-RL\r\n    </a>\r\n    <ul class=\"nav-links\">\r\n      <a href=\"index.html\"             >Home</a>\r\n      <a href=\"dashboard.html\"         >Dashboard</a>\r\n      <a href=\"demo.html\"              >Live Demo</a>\r\n      <a href=\"science.html\" class=\"active\">Science</a>\r\n      <a href=\"compare.html\"           >Compare</a>\r\n    </ul>\r\n    <div class=\"nav-right\">CHECKPOINT-07 &nbsp;·&nbsp; OPEN INNOVATION</div>\r\n  </nav>\r\n\r\n  <!-- ══ PAGE HEADER ══ -->\r\n  <div class=\"sci-header\">\r\n    <div>\r\n      <div class=\"sci-eyebrow\">Architecture · Physics · Algorithms</div>\r\n      <div class=\"sci-title\">The Science</div>\r\n      <div class=\"sci-subtitle\">\r\n        How ProteinFold-RL works — from atoms to actions to learning\r\n      </div>\r\n    </div>\r\n    <div class=\"sci-header-right\">\r\n      <div class=\"sci-tag\">GNN + PPO-clip</div>\r\n      <div class=\"sci-tag\">NeRF kinematics</div>\r\n      <div class=\"sci-tag\">Lennard-Jones potential</div>\r\n    </div>\r\n  </div>\r\n\r\n  <!-- ══ TICKER ══ -->\r\n  <div class=\"ticker\">\r\n    <div class=\"ticker-track\" id=\"ticker-track\"></div>\r\n  </div>\r\n\r\n  <!-- ══════════════════════════════════════════\r\n       SECTION 1 — WHY RL\r\n  ══════════════════════════════════════════ -->\r\n  <section class=\"sci-section\">\r\n    <div class=\"section-label\">01 — the problem · why reinforcement learning</div>\r\n    <div class=\"why-grid\">\r\n      <div class=\"why-text\">\r\n        <div class=\"why-heading\">\r\n          AlphaFold knows the answer.<br>\r\n          It cannot explain the path.\r\n        </div>\r\n        <p class=\"why-para\">\r\n          AlphaFold2 achieved a scientific breakthrough — predicting\r\n          the final 3D structure of a protein from its amino acid sequence\r\n          with near-experimental accuracy. It won the Nobel Prize in 2024.\r\n        </p>\r\n        <p class=\"why-para\">\r\n          But AlphaFold is completely silent about\r\n          <strong>the folding pathway</strong> — the sequence of physical\r\n          conformational changes a protein undergoes as it folds.\r\n          And the pathway is where disease lives.\r\n        </p>\r\n        <p class=\"why-para\">\r\n          <em>Alzheimer's, Parkinson's, Type 2 Diabetes</em> — all caused\r\n          by proteins that misfolded during the journey, not at the\r\n          destination. No dataset of correct folding pathways exists.\r\n          <strong>Physics is the only teacher.</strong>\r\n        </p>\r\n        <p class=\"why-para\">\r\n          Reinforcement learning is the only framework honest enough\r\n          to learn from a physics-based reward signal without requiring\r\n          labelled examples of correct folding trajectories.\r\n        </p>\r\n      </div>\r\n      <div class=\"why-cards\">\r\n        <div class=\"why-card\">\r\n          <div class=\"why-card-icon\">01</div>\r\n          <div class=\"why-card-body\">\r\n            <div class=\"why-card-title\">No labelled data exists</div>\r\n            <div class=\"why-card-desc\">\r\n              Supervised learning requires (input, correct output) pairs.\r\n              No database of correct folding pathways exists at atomic\r\n              resolution. RL learns without labels — reward is physics.\r\n            </div>\r\n          </div>\r\n        </div>\r\n        <div class=\"why-card\">\r\n          <div class=\"why-card-icon\">02</div>\r\n          <div class=\"why-card-body\">\r\n            <div class=\"why-card-title\">Sequential decisions</div>\r\n            <div class=\"why-card-desc\">\r\n              Folding is a sequential process — each dihedral angle\r\n              adjustment depends on the current conformation. RL\r\n              naturally models sequential decision-making over time.\r\n            </div>\r\n          </div>\r\n        </div>\r\n        <div class=\"why-card\">\r\n          <div class=\"why-card-icon\">03</div>\r\n          <div class=\"why-card-body\">\r\n            <div class=\"why-card-title\">Physics as reward</div>\r\n            <div class=\"why-card-desc\">\r\n              The Lennard-Jones energy function provides a\r\n              differentiable, physics-grounded reward signal. Lower\r\n              energy = more stable structure = better fold.\r\n            </div>\r\n          </div>\r\n        </div>\r\n        <div class=\"why-card\">\r\n          <div class=\"why-card-icon\">04</div>\r\n          <div class=\"why-card-body\">\r\n            <div class=\"why-card-title\">Exploration of pathways</div>\r\n            <div class=\"why-card-desc\">\r\n              The PPO entropy bonus encourages exploration of novel\r\n              folding pathways — not just greedy energy minimisation.\r\n              This mirrors how proteins actually explore conformational space.\r\n            </div>\r\n          </div>\r\n        </div>\r\n      </div>\r\n    </div>\r\n  </section>\r\n\r\n  <!-- ══════════════════════════════════════════\r\n       SECTION 2 — RL LOOP DIAGRAM\r\n  ══════════════════════════════════════════ -->\r\n  <section class=\"sci-section\">\r\n    <div class=\"section-label\">02 — RL loop · state → action → reward → policy</div>\r\n    <div class=\"rl-diagram-wrap\">\r\n      <div class=\"rl-diagram-label\">Full RL loop — ProteinFold-RL</div>\r\n      <svg width=\"100%\" viewBox=\"0 0 900 320\"\r\n           fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\"\r\n           style=\"min-width:700px;\">\r\n\r\n        <!-- STATE box -->\r\n        <rect x=\"20\" y=\"100\" width=\"160\" height=\"120\"\r\n              fill=\"rgba(61,159,255,0.06)\"\r\n              stroke=\"rgba(61,159,255,0.3)\" stroke-width=\"0.5\"/>\r\n        <text x=\"100\" y=\"124\" text-anchor=\"middle\"\r\n              font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n              fill=\"rgba(61,159,255,0.5)\" letter-spacing=\"2\">STATE</text>\r\n        <text x=\"100\" y=\"148\" text-anchor=\"middle\"\r\n              font-family=\"Syne,sans-serif\" font-size=\"13\"\r\n              fill=\"#eaf4ff\" font-weight=\"800\">Protein Graph</text>\r\n        <text x=\"100\" y=\"166\" text-anchor=\"middle\"\r\n              font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n              fill=\"rgba(180,210,240,0.45)\">Nodes [N, 23]</text>\r\n        <text x=\"100\" y=\"182\" text-anchor=\"middle\"\r\n              font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n              fill=\"rgba(180,210,240,0.45)\">Edges [E, 4]</text>\r\n        <text x=\"100\" y=\"198\" text-anchor=\"middle\"\r\n              font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n              fill=\"rgba(180,210,240,0.45)\">8Å contacts</text>\r\n\r\n        <!-- Arrow STATE → POLICY -->\r\n        <line x1=\"180\" y1=\"160\" x2=\"238\" y2=\"160\"\r\n              stroke=\"rgba(61,159,255,0.5)\" stroke-width=\"1\"\r\n              marker-end=\"url(#arr)\"/>\r\n\r\n        <!-- POLICY box -->\r\n        <rect x=\"240\" y=\"80\" width=\"160\" height=\"160\"\r\n              fill=\"rgba(255,179,71,0.06)\"\r\n              stroke=\"rgba(255,179,71,0.35)\" stroke-width=\"0.5\"/>\r\n        <text x=\"320\" y=\"104\" text-anchor=\"middle\"\r\n              font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n              fill=\"rgba(255,179,71,0.5)\" letter-spacing=\"2\">POLICY</text>\r\n        <text x=\"320\" y=\"128\" text-anchor=\"middle\"\r\n              font-family=\"Syne,sans-serif\" font-size=\"13\"\r\n              fill=\"#eaf4ff\" font-weight=\"800\">GNN + PPO</text>\r\n        <text x=\"320\" y=\"148\" text-anchor=\"middle\"\r\n              font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n              fill=\"rgba(180,210,240,0.45)\">NodeEncoder</text>\r\n        <text x=\"320\" y=\"164\" text-anchor=\"middle\"\r\n              font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n              fill=\"rgba(255,179,71,0.7)\">4× MPNN layers</text>\r\n        <text x=\"320\" y=\"180\" text-anchor=\"middle\"\r\n              font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n              fill=\"rgba(180,210,240,0.45)\">256-dim global</text>\r\n        <text x=\"320\" y=\"196\" text-anchor=\"middle\"\r\n              font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n              fill=\"rgba(180,210,240,0.45)\">policy head</text>\r\n        <text x=\"320\" y=\"212\" text-anchor=\"middle\"\r\n              font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n              fill=\"rgba(180,210,240,0.45)\">value head</text>\r\n\r\n        <!-- Arrow POLICY → ACTION -->\r\n        <line x1=\"400\" y1=\"160\" x2=\"458\" y2=\"160\"\r\n              stroke=\"rgba(255,179,71,0.5)\" stroke-width=\"1\"\r\n              marker-end=\"url(#arr2)\"/>\r\n\r\n        <!-- ACTION box -->\r\n        <rect x=\"460\" y=\"100\" width=\"160\" height=\"120\"\r\n              fill=\"rgba(0,212,170,0.06)\"\r\n              stroke=\"rgba(0,212,170,0.3)\" stroke-width=\"0.5\"/>\r\n        <text x=\"540\" y=\"124\" text-anchor=\"middle\"\r\n              font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n              fill=\"rgba(0,212,170,0.5)\" letter-spacing=\"2\">ACTION</text>\r\n        <text x=\"540\" y=\"148\" text-anchor=\"middle\"\r\n              font-family=\"Syne,sans-serif\" font-size=\"13\"\r\n              fill=\"#eaf4ff\" font-weight=\"800\">Dihedral Δ</text>\r\n        <text x=\"540\" y=\"166\" text-anchor=\"middle\"\r\n              font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n              fill=\"rgba(180,210,240,0.45)\">N × 2 × 12</text>\r\n        <text x=\"540\" y=\"182\" text-anchor=\"middle\"\r\n              font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n              fill=\"rgba(180,210,240,0.45)\">φ/ψ ± 30°</text>\r\n        <text x=\"540\" y=\"198\" text-anchor=\"middle\"\r\n              font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n              fill=\"rgba(180,210,240,0.45)\">NeRF chain</text>\r\n\r\n        <!-- Arrow ACTION → REWARD -->\r\n        <line x1=\"620\" y1=\"160\" x2=\"678\" y2=\"160\"\r\n              stroke=\"rgba(0,212,170,0.5)\" stroke-width=\"1\"\r\n              marker-end=\"url(#arr3)\"/>\r\n\r\n        <!-- REWARD box -->\r\n        <rect x=\"680\" y=\"100\" width=\"160\" height=\"120\"\r\n              fill=\"rgba(255,95,95,0.06)\"\r\n              stroke=\"rgba(255,95,95,0.3)\" stroke-width=\"0.5\"/>\r\n        <text x=\"760\" y=\"124\" text-anchor=\"middle\"\r\n              font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n              fill=\"rgba(255,95,95,0.5)\" letter-spacing=\"2\">REWARD</text>\r\n        <text x=\"760\" y=\"148\" text-anchor=\"middle\"\r\n              font-family=\"Syne,sans-serif\" font-size=\"13\"\r\n              fill=\"#eaf4ff\" font-weight=\"800\">Physics</text>\r\n        <text x=\"760\" y=\"166\" text-anchor=\"middle\"\r\n              font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n              fill=\"rgba(0,212,170,0.7)\">+8.0 big drop</text>\r\n        <text x=\"760\" y=\"182\" text-anchor=\"middle\"\r\n              font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n              fill=\"rgba(61,159,255,0.7)\">+15.0 RMSD&lt;2Å</text>\r\n        <text x=\"760\" y=\"198\" text-anchor=\"middle\"\r\n              font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n              fill=\"rgba(255,95,95,0.7)\">−2.0 clash</text>\r\n\r\n        <!-- Feedback arrow REWARD → STATE (curved bottom) -->\r\n        <path d=\"M760 220 Q760 280 440 280 Q120 280 100 220\"\r\n              stroke=\"rgba(61,159,255,0.25)\" stroke-width=\"1\"\r\n              fill=\"none\" stroke-dasharray=\"5 3\"\r\n              marker-end=\"url(#arr)\"/>\r\n        <text x=\"440\" y=\"298\" text-anchor=\"middle\"\r\n              font-family=\"Space Mono,monospace\" font-size=\"8\"\r\n              fill=\"rgba(61,159,255,0.3)\" letter-spacing=\"2\">\r\n          NEXT STATE — UPDATED CONFORMATION\r\n        </text>\r\n\r\n        <!-- PPO update arrow (top) -->\r\n        <path d=\"M760 100 Q760 40 540 40 Q320 40 320 80\"\r\n              stroke=\"rgba(255,179,71,0.2)\" stroke-width=\"1\"\r\n              fill=\"none\" stroke-dasharray=\"4 3\"\r\n              marker-end=\"url(#arr2)\"/>\r\n        <text x=\"540\" y=\"28\" text-anchor=\"middle\"\r\n              font-family=\"Space Mono,monospace\" font-size=\"8\"\r\n              fill=\"rgba(255,179,71,0.35)\" letter-spacing=\"2\">\r\n          PPO UPDATE — GAE ADVANTAGE\r\n        </text>\r\n\r\n        <!-- Arrow markers -->\r\n        <defs>\r\n          <marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"8\" refY=\"5\"\r\n                  markerWidth=\"5\" markerHeight=\"5\" orient=\"auto\">\r\n            <path d=\"M2 1L8 5L2 9\" fill=\"none\"\r\n                  stroke=\"rgba(61,159,255,0.5)\" stroke-width=\"1.5\"\r\n                  stroke-linecap=\"round\"/>\r\n          </marker>\r\n          <marker id=\"arr2\" viewBox=\"0 0 10 10\" refX=\"8\" refY=\"5\"\r\n                  markerWidth=\"5\" markerHeight=\"5\" orient=\"auto\">\r\n            <path d=\"M2 1L8 5L2 9\" fill=\"none\"\r\n                  stroke=\"rgba(255,179,71,0.5)\" stroke-width=\"1.5\"\r\n                  stroke-linecap=\"round\"/>\r\n          </marker>\r\n          <marker id=\"arr3\" viewBox=\"0 0 10 10\" refX=\"8\" refY=\"5\"\r\n                  markerWidth=\"5\" markerHeight=\"5\" orient=\"auto\">\r\n            <path d=\"M2 1L8 5L2 9\" fill=\"none\"\r\n                  stroke=\"rgba(0,212,170,0.5)\" stroke-width=\"1.5\"\r\n                  stroke-linecap=\"round\"/>\r\n          </marker>\r\n        </defs>\r\n\r\n      </svg>\r\n    </div>\r\n  </section>\r\n\r\n  <!-- ══════════════════════════════════════════\r\n       SECTION 3 — GNN ARCHITECTURE\r\n  ══════════════════════════════════════════ -->\r\n  <section class=\"sci-section\">\r\n    <div class=\"section-label\">03 — model architecture · graph neural network</div>\r\n    <div class=\"arch-grid\">\r\n\r\n      <!-- Visual: GNN layers diagram -->\r\n      <div class=\"arch-visual\">\r\n        <div class=\"rl-diagram-label\">GNN forward pass</div>\r\n        <svg width=\"100%\" viewBox=\"0 0 380 480\"\r\n             fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\r\n\r\n          <!-- Input -->\r\n          <rect x=\"60\" y=\"10\" width=\"260\" height=\"40\" rx=\"2\"\r\n                fill=\"rgba(61,159,255,0.08)\"\r\n                stroke=\"rgba(61,159,255,0.25)\" stroke-width=\"0.5\"/>\r\n          <text x=\"190\" y=\"28\" text-anchor=\"middle\"\r\n                font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n                fill=\"rgba(61,159,255,0.6)\" letter-spacing=\"1\">INPUT</text>\r\n          <text x=\"190\" y=\"42\" text-anchor=\"middle\"\r\n                font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n                fill=\"rgba(180,210,240,0.5)\">\r\n            protein graph · nodes [N,23] · edges [E,4]\r\n          </text>\r\n\r\n          <line x1=\"190\" y1=\"50\" x2=\"190\" y2=\"68\"\r\n                stroke=\"rgba(61,159,255,0.3)\" stroke-width=\"0.5\"\r\n                marker-end=\"url(#ga)\"/>\r\n\r\n          <!-- Node encoder -->\r\n          <rect x=\"80\" y=\"70\" width=\"220\" height=\"36\" rx=\"2\"\r\n                fill=\"rgba(61,159,255,0.1)\"\r\n                stroke=\"rgba(61,159,255,0.3)\" stroke-width=\"0.5\"/>\r\n          <text x=\"190\" y=\"86\" text-anchor=\"middle\"\r\n                font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n                fill=\"rgba(61,159,255,0.7)\" letter-spacing=\"1\">NODE ENCODER</text>\r\n          <text x=\"190\" y=\"100\" text-anchor=\"middle\"\r\n                font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n                fill=\"rgba(180,210,240,0.45)\">Linear(23→128) → GELU → Linear(128→128)</text>\r\n\r\n          <line x1=\"190\" y1=\"106\" x2=\"190\" y2=\"124\"\r\n                stroke=\"rgba(61,159,255,0.3)\" stroke-width=\"0.5\"\r\n                marker-end=\"url(#ga)\"/>\r\n\r\n          <!-- Edge encoder -->\r\n          <rect x=\"80\" y=\"126\" width=\"220\" height=\"36\" rx=\"2\"\r\n                fill=\"rgba(61,159,255,0.08)\"\r\n                stroke=\"rgba(61,159,255,0.2)\" stroke-width=\"0.5\"/>\r\n          <text x=\"190\" y=\"142\" text-anchor=\"middle\"\r\n                font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n                fill=\"rgba(61,159,255,0.6)\" letter-spacing=\"1\">EDGE ENCODER</text>\r\n          <text x=\"190\" y=\"156\" text-anchor=\"middle\"\r\n                font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n                fill=\"rgba(180,210,240,0.45)\">Linear(4→64) → GELU → Linear(64→64)</text>\r\n\r\n          <line x1=\"190\" y1=\"162\" x2=\"190\" y2=\"180\"\r\n                stroke=\"rgba(255,179,71,0.4)\" stroke-width=\"0.5\"\r\n                marker-end=\"url(#gb)\"/>\r\n\r\n          <!-- MPNN 1 -->\r\n          <rect x=\"40\" y=\"182\" width=\"300\" height=\"32\" rx=\"2\"\r\n                fill=\"rgba(255,179,71,0.08)\"\r\n                stroke=\"rgba(255,179,71,0.3)\" stroke-width=\"0.5\"/>\r\n          <text x=\"190\" y=\"196\" text-anchor=\"middle\"\r\n                font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n                fill=\"rgba(255,179,71,0.7)\" letter-spacing=\"1\">MPNN LAYER 1</text>\r\n          <text x=\"190\" y=\"208\" text-anchor=\"middle\"\r\n                font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n                fill=\"rgba(180,210,240,0.4)\">message passing · 128-dim · edge-conditioned</text>\r\n\r\n          <line x1=\"190\" y1=\"214\" x2=\"190\" y2=\"228\"\r\n                stroke=\"rgba(255,179,71,0.4)\" stroke-width=\"0.5\"\r\n                marker-end=\"url(#gb)\"/>\r\n\r\n          <!-- MPNN 2 -->\r\n          <rect x=\"40\" y=\"230\" width=\"300\" height=\"32\" rx=\"2\"\r\n                fill=\"rgba(255,179,71,0.08)\"\r\n                stroke=\"rgba(255,179,71,0.3)\" stroke-width=\"0.5\"/>\r\n          <text x=\"190\" y=\"244\" text-anchor=\"middle\"\r\n                font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n                fill=\"rgba(255,179,71,0.7)\" letter-spacing=\"1\">MPNN LAYER 2</text>\r\n          <text x=\"190\" y=\"256\" text-anchor=\"middle\"\r\n                font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n                fill=\"rgba(180,210,240,0.4)\">message passing · 128-dim · edge-conditioned</text>\r\n\r\n          <line x1=\"190\" y1=\"262\" x2=\"190\" y2=\"276\"\r\n                stroke=\"rgba(255,179,71,0.4)\" stroke-width=\"0.5\"\r\n                marker-end=\"url(#gb)\"/>\r\n\r\n          <!-- MPNN 3+4 collapsed -->\r\n          <rect x=\"40\" y=\"278\" width=\"300\" height=\"32\" rx=\"2\"\r\n                fill=\"rgba(255,179,71,0.08)\"\r\n                stroke=\"rgba(255,179,71,0.3)\" stroke-width=\"0.5\"/>\r\n          <text x=\"190\" y=\"292\" text-anchor=\"middle\"\r\n                font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n                fill=\"rgba(255,179,71,0.7)\" letter-spacing=\"1\">MPNN LAYERS 3 + 4</text>\r\n          <text x=\"190\" y=\"306\" text-anchor=\"middle\"\r\n                font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n                fill=\"rgba(180,210,240,0.4)\">same · total 4 layers · residual connections</text>\r\n\r\n          <line x1=\"190\" y1=\"310\" x2=\"190\" y2=\"328\"\r\n                stroke=\"rgba(61,159,255,0.4)\" stroke-width=\"0.5\"\r\n                marker-end=\"url(#ga)\"/>\r\n\r\n          <!-- Global pool -->\r\n          <rect x=\"80\" y=\"330\" width=\"220\" height=\"32\" rx=\"2\"\r\n                fill=\"rgba(61,159,255,0.1)\"\r\n                stroke=\"rgba(61,159,255,0.3)\" stroke-width=\"0.5\"/>\r\n          <text x=\"190\" y=\"344\" text-anchor=\"middle\"\r\n                font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n                fill=\"rgba(61,159,255,0.7)\" letter-spacing=\"1\">GLOBAL MEAN POOL</text>\r\n          <text x=\"190\" y=\"358\" text-anchor=\"middle\"\r\n                font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n                fill=\"rgba(180,210,240,0.45)\">128-dim → Linear(128→256) → GELU</text>\r\n\r\n          <line x1=\"120\" y1=\"362\" x2=\"80\"  y2=\"400\"\r\n                stroke=\"rgba(0,212,170,0.4)\" stroke-width=\"0.5\"\r\n                marker-end=\"url(#gc)\"/>\r\n          <line x1=\"260\" y1=\"362\" x2=\"300\" y2=\"400\"\r\n                stroke=\"rgba(255,95,95,0.4)\" stroke-width=\"0.5\"\r\n                marker-end=\"url(#gd)\"/>\r\n\r\n          <!-- Policy head -->\r\n          <rect x=\"10\" y=\"402\" width=\"160\" height=\"36\" rx=\"2\"\r\n                fill=\"rgba(0,212,170,0.08)\"\r\n                stroke=\"rgba(0,212,170,0.25)\" stroke-width=\"0.5\"/>\r\n          <text x=\"90\" y=\"418\" text-anchor=\"middle\"\r\n                font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n                fill=\"rgba(0,212,170,0.7)\" letter-spacing=\"1\">POLICY HEAD</text>\r\n          <text x=\"90\" y=\"432\" text-anchor=\"middle\"\r\n                font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n                fill=\"rgba(180,210,240,0.45)\">Linear(256→action_dim)</text>\r\n\r\n          <!-- Value head -->\r\n          <rect x=\"210\" y=\"402\" width=\"160\" height=\"36\" rx=\"2\"\r\n                fill=\"rgba(255,95,95,0.08)\"\r\n                stroke=\"rgba(255,95,95,0.25)\" stroke-width=\"0.5\"/>\r\n          <text x=\"290\" y=\"418\" text-anchor=\"middle\"\r\n                font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n                fill=\"rgba(255,95,95,0.7)\" letter-spacing=\"1\">VALUE HEAD</text>\r\n          <text x=\"290\" y=\"432\" text-anchor=\"middle\"\r\n                font-family=\"Space Mono,monospace\" font-size=\"9\"\r\n                fill=\"rgba(180,210,240,0.45)\">Linear(256→128→1)</text>\r\n\r\n          <!-- Output labels -->\r\n          <text x=\"90\" y=\"458\" text-anchor=\"middle\"\r\n                font-family=\"Space Mono,monospace\" font-size=\"8\"\r\n                fill=\"rgba(0,212,170,0.5)\">action logits</text>\r\n          <text x=\"290\" y=\"458\" text-anchor=\"middle\"\r\n                font-family=\"Space Mono,monospace\" font-size=\"8\"\r\n                fill=\"rgba(255,95,95,0.5)\">state value V(s)</text>\r\n\r\n          <defs>\r\n            <marker id=\"ga\" viewBox=\"0 0 10 10\" refX=\"8\" refY=\"5\"\r\n                    markerWidth=\"4\" markerHeight=\"4\" orient=\"auto\">\r\n              <path d=\"M2 1L8 5L2 9\" fill=\"none\"\r\n                    stroke=\"rgba(61,159,255,0.5)\" stroke-width=\"1.5\"\r\n                    stroke-linecap=\"round\"/>\r\n            </marker>\r\n            <marker id=\"gb\" viewBox=\"0 0 10 10\" refX=\"8\" refY=\"5\"\r\n                    markerWidth=\"4\" markerHeight=\"4\" orient=\"auto\">\r\n              <path d=\"M2 1L8 5L2 9\" fill=\"none\"\r\n                    stroke=\"rgba(255,179,71,0.5)\" stroke-width=\"1.5\"\r\n                    stroke-linecap=\"round\"/>\r\n            </marker>\r\n            <marker id=\"gc\" viewBox=\"0 0 10 10\" refX=\"8\" refY=\"5\"\r\n                    markerWidth=\"4\" markerHeight=\"4\" orient=\"auto\">\r\n              <path d=\"M2 1L8 5L2 9\" fill=\"none\"\r\n                    stroke=\"rgba(0,212,170,0.5)\" stroke-width=\"1.5\"\r\n                    stroke-linecap=\"round\"/>\r\n            </marker>\r\n            <marker id=\"gd\" viewBox=\"0 0 10 10\" refX=\"8\" refY=\"5\"\r\n                    markerWidth=\"4\" markerHeight=\"4\" orient=\"auto\">\r\n              <path d=\"M2 1L8 5L2 9\" fill=\"none\"\r\n                    stroke=\"rgba(255,95,95,0.5)\" stroke-width=\"1.5\"\r\n                    stroke-linecap=\"round\"/>\r\n            </marker>\r\n          </defs>\r\n        </svg>\r\n      </div>\r\n\r\n      <!-- Text explanation -->\r\n      <div class=\"arch-text\">\r\n        <div class=\"arch-heading\">Graph Neural Network Policy</div>\r\n        <p class=\"arch-para\">\r\n          The protein is represented as a <strong>molecular graph</strong>\r\n          where each residue is a node and spatial contacts within\r\n          <em>8 Angstroms</em> are edges. This preserves the physical\r\n          topology of the molecule — unlike flat feature vectors.\r\n        </p>\r\n        <p class=\"arch-para\">\r\n          <strong>Message passing</strong> allows each residue to\r\n          aggregate information from its spatial neighbours over\r\n          4 rounds — capturing both local secondary structure and\r\n          global fold topology simultaneously.\r\n        </p>\r\n        <p class=\"arch-para\">\r\n          The <em>global mean pool</em> compresses the entire protein\r\n          into a single 256-dimensional vector — the \"state embedding\"\r\n          used by both the policy and value heads.\r\n        </p>\r\n\r\n        <table class=\"arch-table\">\r\n          <tr>\r\n            <td>Node input</td>\r\n            <td>20-dim AA one-hot + 3-dim Cα coords = [N, 23]</td>\r\n          </tr>\r\n          <tr>\r\n            <td>Edge input</td>\r\n            <td>distance + direction + peptide flag = [E, 4]</td>\r\n          </tr>\r\n          <tr>\r\n            <td>Hidden dim</td>\r\n            <td>128 node · 64 edge · 256 global</td>\r\n          </tr>\r\n          <tr>\r\n            <td>Layers</td>\r\n            <td>4× MPNN with edge-conditioned messages</td>\r\n          </tr>\r\n          <tr>\r\n            <td>Activation</td>\r\n            <td>GELU throughout</td>\r\n          </tr>\r\n          <tr>\r\n            <td>Init</td>\r\n            <td>Orthogonal weights · gain=0.01</td>\r\n          </tr>\r\n          <tr>\r\n            <td>Policy out</td>\r\n            <td>logits [1, N×2×12] → Categorical dist</td>\r\n          </tr>\r\n          <tr>\r\n            <td>Value out</td>\r\n            <td>scalar V(s) for GAE advantage estimation</td>\r\n          </tr>\r\n        </table>\r\n      </div>\r\n\r\n    </div>\r\n  </section>\r\n\r\n  <!-- ══════════════════════════════════════════\r\n       SECTION 4 — ENERGY + REWARD\r\n  ══════════════════════════════════════════ -->\r\n  <section class=\"sci-section\">\r\n    <div class=\"section-label\">04 — energy function · physics-based reward signal</div>\r\n    <div class=\"energy-grid\">\r\n\r\n      <div>\r\n        <div class=\"arch-heading\" style=\"margin-bottom:1.25rem;\">\r\n          The Physics Teacher\r\n        </div>\r\n        <p class=\"arch-para\">\r\n          The reward signal comes entirely from a\r\n          <strong>coarse-grained physics potential</strong> —\r\n          no human labels, no expert demonstrations.\r\n          This is justified by its use in MARTINI coarse-grained models,\r\n          published in <em>Nature Methods</em>.\r\n        </p>\r\n\r\n        <div class=\"eq-block\">\r\n          <div class=\"eq-label\">Lennard-Jones potential (pairwise)</div>\r\n          <div class=\"eq-formula\">\r\n            E_LJ = 4ε [ (σ/r)¹² − (σ/r)⁶ ]\r\n          </div>\r\n          <div class=\"eq-desc\">\r\n            <span>r</span> = Cα–Cα distance ·\r\n            <span>ε</span> = well depth ·\r\n            <span>σ</span> = collision diameter<br>\r\n            Repulsion dominates at short range · attraction at medium range\r\n          </div>\r\n        </div>\r\n\r\n        <div class=\"eq-block\" style=\"border-left-color:var(--teal);\">\r\n          <div class=\"eq-label\">Torsion energy (Ramachandran)</div>\r\n          <div class=\"eq-formula\">\r\n            E_tor = Σ k[1 + cos(nφ − δ)]\r\n          </div>\r\n          <div class=\"eq-desc\">\r\n            <span>φ, ψ</span> = backbone dihedral angles ·\r\n            <span>n</span> = periodicity ·\r\n            <span>δ</span> = phase<br>\r\n            Penalises sterically forbidden Ramachandran regions\r\n          </div>\r\n        </div>\r\n\r\n        <div class=\"eq-block\" style=\"border-left-color:var(--amber);\">\r\n          <div class=\"eq-label\">Total energy</div>\r\n          <div class=\"eq-formula\">\r\n            E_total = E_LJ + E_torsion\r\n          </div>\r\n          <div class=\"eq-desc\">\r\n            Computed at every step · delta used as reward signal ·\r\n            <span>lower = more stable = better fold</span>\r\n          </div>\r\n        </div>\r\n      </div>\r\n\r\n      <!-- Reward table -->\r\n      <div>\r\n        <div class=\"arch-heading\" style=\"margin-bottom:1.25rem;\">\r\n          Reward Function\r\n        </div>\r\n        <div class=\"reward-table-wrap\">\r\n          <div class=\"reward-table-header\">\r\n            All 7 reward cases · applied every step\r\n          </div>\r\n          <div class=\"reward-row\">\r\n            <div class=\"rr-condition\">Energy drop &gt; 1.0 kcal/mol</div>\r\n            <div class=\"rr-val\" style=\"color:var(--teal);\">+8.0</div>\r\n            <div class=\"rr-bar\">\r\n              <div class=\"rr-bar-fill\"\r\n                   style=\"--w:100%;--c:var(--teal);\"></div>\r\n            </div>\r\n          </div>\r\n          <div class=\"reward-row\">\r\n            <div class=\"rr-condition\">RMSD &lt; 2Å vs native</div>\r\n            <div class=\"rr-val\" style=\"color:var(--teal);\">+15.0</div>\r\n            <div class=\"rr-bar\">\r\n              <div class=\"rr-bar-fill\"\r\n                   style=\"--w:100%;--c:var(--teal);\"></div>\r\n            </div>\r\n          </div>\r\n          <div class=\"reward-row\">\r\n            <div class=\"rr-condition\">Small energy drop</div>\r\n            <div class=\"rr-val\" style=\"color:var(--blue);\">+2.0</div>\r\n            <div class=\"rr-bar\">\r\n              <div class=\"rr-bar-fill\"\r\n                   style=\"--w:25%;--c:var(--blue);\"></div>\r\n            </div>\r\n          </div>\r\n          <div class=\"reward-row\">\r\n            <div class=\"rr-condition\">No steric clash</div>\r\n            <div class=\"rr-val\" style=\"color:var(--blue);\">+1.0</div>\r\n            <div class=\"rr-bar\">\r\n              <div class=\"rr-bar-fill\"\r\n                   style=\"--w:12%;--c:var(--blue);\"></div>\r\n            </div>\r\n          </div>\r\n          <div class=\"reward-row\">\r\n            <div class=\"rr-condition\">Per-step penalty</div>\r\n            <div class=\"rr-val\" style=\"color:var(--amber);\">−0.3</div>\r\n            <div class=\"rr-bar\">\r\n              <div class=\"rr-bar-fill\"\r\n                   style=\"--w:4%;--c:var(--amber);\"></div>\r\n            </div>\r\n          </div>\r\n          <div class=\"reward-row\">\r\n            <div class=\"rr-condition\">Energy increases</div>\r\n            <div class=\"rr-val\" style=\"color:var(--red);\">−1.0</div>\r\n            <div class=\"rr-bar\">\r\n              <div class=\"rr-bar-fill\"\r\n                   style=\"--w:12%;--c:var(--red);\"></div>\r\n            </div>\r\n          </div>\r\n          <div class=\"reward-row\">\r\n            <div class=\"rr-condition\">Steric clash detected</div>\r\n            <div class=\"rr-val\" style=\"color:var(--red);\">−2.0</div>\r\n            <div class=\"rr-bar\">\r\n              <div class=\"rr-bar-fill\"\r\n                   style=\"--w:25%;--c:var(--red);\"></div>\r\n            </div>\r\n          </div>\r\n        </div>\r\n      </div>\r\n\r\n    </div>\r\n  </section>\r\n\r\n  <!-- ══════════════════════════════════════════\r\n       SECTION 5 — PPO\r\n  ══════════════════════════════════════════ -->\r\n  <section class=\"sci-section\">\r\n    <div class=\"section-label\">05 — PPO-clip · proximal policy optimisation</div>\r\n    <div class=\"ppo-grid\">\r\n\r\n      <div>\r\n        <div class=\"arch-heading\" style=\"margin-bottom:1.25rem;\">\r\n          Why PPO-clip?\r\n        </div>\r\n        <p class=\"arch-para\">\r\n          PPO-clip prevents catastrophic policy updates by\r\n          <strong>clipping the probability ratio</strong> between the\r\n          old and new policy. This ensures stable training even with\r\n          a high-dimensional, physics-driven reward signal.\r\n        </p>\r\n\r\n        <div class=\"eq-block\" style=\"border-left-color:var(--amber);\">\r\n          <div class=\"eq-label\">PPO-clip objective</div>\r\n          <div class=\"eq-formula\">\r\n            L = E[ min(r·A, clip(r, 1−ε, 1+ε)·A) ]\r\n          </div>\r\n          <div class=\"eq-desc\">\r\n            <span>r</span> = π_new / π_old ·\r\n            <span>A</span> = GAE advantage ·\r\n            <span>ε</span> = 0.2<br>\r\n            Clip prevents destructively large policy updates\r\n          </div>\r\n        </div>\r\n\r\n        <div class=\"eq-block\" style=\"border-left-color:var(--blue);\">\r\n          <div class=\"eq-label\">GAE advantage (λ=0.95)</div>\r\n          <div class=\"eq-formula\">\r\n            A_t = Σ (γλ)^k δ_{t+k}\r\n          </div>\r\n          <div class=\"eq-desc\">\r\n            <span>δ</span> = TD error ·\r\n            <span>γ</span> = 0.99 discount ·\r\n            <span>λ</span> = 0.95 bias-variance tradeoff<br>\r\n            Lower variance than Monte Carlo · lower bias than TD(0)\r\n          </div>\r\n        </div>\r\n      </div>\r\n\r\n      <div>\r\n        <div class=\"arch-heading\" style=\"margin-bottom:1.25rem;\">\r\n          Hyperparameters\r\n        </div>\r\n        <div class=\"ppo-params\">\r\n          <div class=\"ppo-param-row\">\r\n            <div class=\"pp-key\">Clip ε</div>\r\n            <div class=\"pp-val\">0.2</div>\r\n            <div class=\"pp-desc\">prevents large updates</div>\r\n          </div>\r\n          <div class=\"ppo-param-row\">\r\n            <div class=\"pp-key\">Discount γ</div>\r\n            <div class=\"pp-val\">0.99</div>\r\n            <div class=\"pp-desc\">long-horizon planning</div>\r\n          </div>\r\n          <div class=\"ppo-param-row\">\r\n            <div class=\"pp-key\">GAE λ</div>\r\n            <div class=\"pp-val\">0.95</div>\r\n            <div class=\"pp-desc\">bias-variance balance</div>\r\n          </div>\r\n          <div class=\"ppo-param-row\">\r\n            <div class=\"pp-key\">Horizon T</div>\r\n            <div class=\"pp-val\">256</div>\r\n            <div class=\"pp-desc\">steps per update</div>\r\n          </div>\r\n          <div class=\"ppo-param-row\">\r\n            <div class=\"pp-key\">Epochs</div>\r\n            <div class=\"pp-val\">4</div>\r\n            <div class=\"pp-desc\">updates per batch</div>\r\n          </div>\r\n          <div class=\"ppo-param-row\">\r\n            <div class=\"pp-key\">Entropy β</div>\r\n            <div class=\"pp-val\">0.01</div>\r\n            <div class=\"pp-desc\">exploration bonus</div>\r\n          </div>\r\n          <div class=\"ppo-param-row\">\r\n            <div class=\"pp-key\">Value coeff</div>\r\n            <div class=\"pp-val\">0.5</div>\r\n            <div class=\"pp-desc\">value loss weight</div>\r\n          </div>\r\n          <div class=\"ppo-param-row\">\r\n            <div class=\"pp-key\">Grad clip</div>\r\n            <div class=\"pp-val\">0.5</div>\r\n            <div class=\"pp-desc\">prevents explosion</div>\r\n          </div>\r\n          <div class=\"ppo-param-row\">\r\n            <div class=\"pp-key\">Learning rate</div>\r\n            <div class=\"pp-val\">3e-4</div>\r\n            <div class=\"pp-desc\">AdamW optimiser</div>\r\n          </div>\r\n          <div class=\"ppo-param-row\">\r\n            <div class=\"pp-key\">Reward norm</div>\r\n            <div class=\"pp-val\">ON</div>\r\n            <div class=\"pp-desc\">per-batch normalisation</div>\r\n          </div>\r\n        </div>\r\n      </div>\r\n\r\n    </div>\r\n  </section>\r\n\r\n  <!-- ══════════════════════════════════════════\r\n       SECTION 6 — SCIENTIFIC JUSTIFICATION\r\n  ══════════════════════════════════════════ -->\r\n  <section class=\"sci-section\" style=\"border-bottom:none;\">\r\n    <div class=\"section-label\">\r\n      06 — scientific justification · judge questions answered\r\n    </div>\r\n    <div class=\"justify-grid\">\r\n      <div class=\"justify-card\" style=\"--ac:var(--blue);\">\r\n        <div class=\"justify-num\">Q1</div>\r\n        <div class=\"justify-title\">\r\n          Why simplified energy, not full MD?\r\n        </div>\r\n        <div class=\"justify-body\">\r\n          Full molecular dynamics takes <strong>hours per protein</strong>\r\n          on a supercomputer — incompatible with a real-time RL training loop\r\n          that runs thousands of steps per second.<br><br>\r\n          Our Lennard-Jones backbone potential captures the dominant forces\r\n          governing secondary structure formation. This is the same\r\n          approximation used in <strong>MARTINI coarse-grained models</strong>\r\n          — published in Nature Methods and used by research groups globally.\r\n          Scientifically justified. Computationally necessary.\r\n        </div>\r\n      </div>\r\n      <div class=\"justify-card\" style=\"--ac:var(--teal);\">\r\n        <div class=\"justify-num\">Q2</div>\r\n        <div class=\"justify-title\">\r\n          Can a hackathon project contribute anything real?\r\n        </div>\r\n        <div class=\"justify-body\">\r\n          We are not claiming to cure Alzheimer's in 36 hours.\r\n          We are demonstrating that <strong>RL with a physics-based reward\r\n          is a viable framework</strong> for exploring folding pathways —\r\n          never demonstrated in an open, accessible way before.<br><br>\r\n          AlphaFold itself began as a proof of concept at a CASP competition.\r\n          Every major breakthrough starts as a demonstration the approach works.\r\n          <strong>This is ours.</strong>\r\n        </div>\r\n      </div>\r\n      <div class=\"justify-card\" style=\"--ac:var(--amber);\">\r\n        <div class=\"justify-num\">Q3</div>\r\n        <div class=\"justify-title\">\r\n          Why GNN and not a simpler model?\r\n        </div>\r\n        <div class=\"justify-body\">\r\n          Proteins are graphs — residues connected by covalent bonds\r\n          and spatial contacts. A flat MLP treats the protein as an\r\n          unordered feature vector and loses all structural information.<br><br>\r\n          <strong>GNNs are the natural architecture</strong> for\r\n          graph-structured data. Message passing propagates local chemical\r\n          information across the full protein topology — exactly what is\r\n          needed to make spatially-aware folding decisions.\r\n        </div>\r\n      </div>\r\n    </div>\r\n  </section>\r\n\r\n  <!-- ══ PASS BADGE ══ -->\r\n  <div class=\"pass-row\">\r\n    <div class=\"pass-dot\"></div>\r\n    <div class=\"pass-text\">\r\n      GNN + PPO-clip · Lennard-Jones potential · NeRF kinematics ·\r\n      MARTINI-justified coarse-graining · physics is the teacher ✓\r\n    </div>\r\n  </div>\r\n\r\n  <!-- ══ FOOTER ══ -->\r\n  <footer class=\"footer\">\r\n    <div class=\"footer-l\">\r\n      ProteinFold-RL · NIT Delhi · Open Innovation Track · 2025\r\n    </div>\r\n    <div class=\"footer-r\">science.html · page 4 of 5</div>\r\n  </footer>\r\n\r\n</div>\r\n\r\n<script src=\"assets/js/stars.js\"></script>\r\n<script src=\"assets/js/ticker.js\"></script>\r\n<script>\r\n  initStarfield();\r\n  initTicker();\r\n</script>\r\n\r\n</body>\r\n</html>
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/frontend/science.html b/frontend/science.html
+--- a/frontend/science.html	(revision 71456e9b6125c185e2860ce677a90484ef9d4150)
++++ b/frontend/science.html	(date 1777142596021)
+@@ -431,6 +431,7 @@
+       <a href="demo.html"              >Live Demo</a>
+       <a href="science.html" class="active">Science</a>
+       <a href="compare.html"           >Compare</a>
++        <a href="critical.html"              >Critical Points</a>
+     </ul>
+     <div class="nav-right">CHECKPOINT-07 &nbsp;·&nbsp; OPEN INNOVATION</div>
+   </nav>
+Index: data/prepare_data.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/data/prepare_data.py b/data/prepare_data.py
+--- a/data/prepare_data.py	(revision 71456e9b6125c185e2860ce677a90484ef9d4150)
++++ b/data/prepare_data.py	(date 1777138606948)
+@@ -1,0 +1,50 @@
++import urllib.request
++import os
++
++PDB_IDS = {
++    "1L2Y": "trp_cage",    # Trp-cage — 20 residues
++    "1YRF": "villin"       # Villin headpiece — 35 residues
++}
++
++SAVE_DIR = os.path.join(os.path.dirname(__file__), "structures")
++
++
++def download_pdb(pdb_id: str, save_dir: str) -> str:
++    os.makedirs(save_dir, exist_ok=True)
++    url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
++    save_path = os.path.join(save_dir, f"{pdb_id}.pdb")
++
++    if os.path.exists(save_path):
++        print(f"[SKIP] {pdb_id}.pdb already exists.")
++        return save_path
++
++    print(f"[DOWNLOAD] Fetching {pdb_id} from RCSB...")
++    urllib.request.urlretrieve(url, save_path)
++    print(f"[OK] Saved to {save_path}")
++    return save_path
++
++
++def verify_pdb(path: str) -> bool:
++    with open(path, "r") as f:
++        lines = f.readlines()
++    atom_lines = [l for l in lines if l.startswith("ATOM")]
++    print(f"[VERIFY] {os.path.basename(path)} — {len(atom_lines)} ATOM records found.")
++    return len(atom_lines) > 0
++
++
++if __name__ == "__main__":
++    print("=" * 50)
++    print("ProteinFold-RL — PDB Data Preparation")
++    print("=" * 50)
++
++    for pdb_id, name in PDB_IDS.items():
++        path = download_pdb(pdb_id, SAVE_DIR)
++        ok = verify_pdb(path)
++        if ok:
++            print(f"[READY] {name} ({pdb_id}) ✓")
++        else:
++            print(f"[ERROR] {name} ({pdb_id}) — no ATOM records!")
++
++    print("=" * 50)
++    print("All PDB files ready. Proceed to CHECKPOINT-01.")
++    print("=" * 50)
+\ No newline at end of file
+Index: data/curriculum.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/data/curriculum.py b/data/curriculum.py
+--- a/data/curriculum.py	(revision 71456e9b6125c185e2860ce677a90484ef9d4150)
++++ b/data/curriculum.py	(date 1777138576135)
+@@ -1,0 +1,396 @@
++"""
++data/curriculum.py
++ProteinFold-RL — Curriculum Engine
++
++One job: decide which protein the agent trains on, and when to advance.
++
++Advancement logic
++-----------------
++- Agent trains on proteins in stage order (Stage 1 → 2 → 3 → 4).
++- Within a stage, proteins are visited in order.
++- GATE: agent must achieve rolling mean RMSD < protein.rmsd_gate
++  over the last GATE_WINDOW episodes to advance.
++- FALLBACK: if GATE_PATIENCE episodes pass without hitting the gate,
++  advance anyway. Agent never gets permanently stuck.
++- MINIMUM: at least MIN_EPISODES on a protein before gate is checked.
++
++Replay (anti-forgetting)
++------------------------
++- Once a stage is unlocked, proteins from ALL unlocked stages are
++  sampled each episode, with older stages getting less weight.
++- This prevents the agent from forgetting what it already learned.
++
++Serialization
++-------------
++- Full state saved to JSON alongside model checkpoints.
++- Training can be resumed exactly from where it stopped.
++
++Run : python data/curriculum.py   (self-test)
++"""
++
++import json
++import os
++import sys
++from collections import deque
++from typing import Dict, List, Optional, Tuple
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from data.protein_registry import (
++    REGISTRY, BY_STAGE, ProteinEntry, get_stage, get_protein
++)
++
++# ── Advancement constants ─────────────────────────────────────
++GATE_WINDOW   = 10    # rolling window size (episodes)
++MIN_EPISODES  = 30    # minimum episodes before gate is checked
++GATE_PATIENCE = 100   # max episodes before forced advancement
++
++# ── Replay weight for older stages ───────────────────────────
++# Stage k gets weight REPLAY_DECAY^(current_stage - k)
++# e.g. current=3, stage=1 → 0.3^2 = 0.09  (mostly current stage)
++REPLAY_DECAY  = 0.3
++
++
++class ProteinCurriculum:
++    """
++    Curriculum manager for ProteinFold-RL.
++
++    Typical usage in training loop
++    -------------------------------
++    curriculum = ProteinCurriculum()
++
++    for episode in range(N_EPISODES):
++        protein = curriculum.sample_protein()       # which protein to use
++        # ... run episode ...
++        curriculum.record(protein.pdb_id, rmsd)    # log the result
++        curriculum.maybe_advance()                 # advance if gate met
++    """
++
++    def __init__(self):
++        self.current_stage     : int = 1
++        self.current_idx       : int = 0   # index within current stage
++        self.global_episode    : int = 0
++        self.patience_counter  : int = 0
++
++        # Per-protein RMSD history (rolling window)
++        self.rmsd_history: Dict[str, deque] = {
++            p.pdb_id: deque(maxlen=GATE_WINDOW) for p in REGISTRY
++        }
++
++        # Per-protein episode counts
++        self.episode_counts: Dict[str, int] = {
++            p.pdb_id: 0 for p in REGISTRY
++        }
++
++        # Log of every advancement that happened
++        self.advancement_log: List[dict] = []
++
++    # ── Primary protein ───────────────────────────────────────
++
++    def current_protein(self) -> ProteinEntry:
++        """The protein the agent is currently focused on."""
++        proteins = get_stage(self.current_stage)
++        idx = min(self.current_idx, len(proteins) - 1)
++        return proteins[idx]
++
++    # ── Sampling (with replay) ────────────────────────────────
++
++    def sample_protein(self) -> ProteinEntry:
++        """
++        Sample a protein for one episode.
++
++        Current stage proteins are sampled most often.
++        Older stages are sampled with decaying weight
++        to prevent catastrophic forgetting.
++        """
++        import random
++
++        candidates : List[ProteinEntry] = []
++        weights    : List[float]        = []
++
++        for stage in range(1, self.current_stage + 1):
++            w = REPLAY_DECAY ** (self.current_stage - stage)
++            for p in get_stage(stage):
++                candidates.append(p)
++                weights.append(w)
++
++        return random.choices(candidates, weights=weights, k=1)[0]
++
++    # ── Recording ─────────────────────────────────────────────
++
++    def record(self, pdb_id: str, rmsd: float) -> None:
++        """
++        Record the RMSD result of one episode.
++
++        Parameters
++        ----------
++        pdb_id : protein that was trained this episode
++        rmsd   : final RMSD vs native structure (Å)
++        """
++        self.rmsd_history[pdb_id].append(rmsd)
++        self.episode_counts[pdb_id] += 1
++        self.global_episode        += 1
++        self.patience_counter      += 1
++
++    # ── Advancement ───────────────────────────────────────────
++
++    def gate_met(self) -> bool:
++        """
++        True if the rolling mean RMSD for the current protein
++        is below its gate threshold, and minimum episodes are done.
++        """
++        p       = self.current_protein()
++        history = self.rmsd_history[p.pdb_id]
++        n       = self.episode_counts[p.pdb_id]
++
++        if n < MIN_EPISODES or len(history) < GATE_WINDOW:
++            return False
++
++        return (sum(history) / len(history)) < p.rmsd_gate
++
++    def patience_exhausted(self) -> bool:
++        """True if agent has been stuck too long — force advance."""
++        return self.patience_counter >= GATE_PATIENCE
++
++    def maybe_advance(self) -> Tuple[bool, str]:
++        """
++        Check gate and patience. Advance if either is triggered.
++
++        Returns
++        -------
++        (advanced: bool, reason: str)
++          reason is "gate", "patience", or "" (no advancement)
++        """
++        if self._is_complete():
++            return False, ""
++
++        reason = ""
++        if self.gate_met():
++            reason = "gate"
++        elif self.patience_exhausted():
++            reason = "patience"
++
++        if reason:
++            self._advance(reason)
++            return True, reason
++
++        return False, ""
++
++    def _advance(self, reason: str) -> None:
++        """Move to the next protein or stage."""
++        old = self.current_protein()
++        self.patience_counter = 0   # reset patience on every advance
++
++        stage_proteins = get_stage(self.current_stage)
++
++        if self.current_idx + 1 < len(stage_proteins):
++            # Next protein within same stage
++            self.current_idx += 1
++        else:
++            # Move to next stage if it exists
++            next_stage = self.current_stage + 1
++            if next_stage in BY_STAGE:
++                self.current_stage = next_stage
++                self.current_idx   = 0
++
++        new = self.current_protein()
++
++        self.advancement_log.append({
++            "global_episode" : self.global_episode,
++            "from"           : old.pdb_id,
++            "to"             : new.pdb_id,
++            "stage"          : self.current_stage,
++            "reason"         : reason,
++        })
++
++        print(
++            f"\n{'─' * 52}\n"
++            f"  [CURRICULUM] Advancing!\n"
++            f"  From  : {old.pdb_id} ({old.name})\n"
++            f"  To    : {new.pdb_id} ({new.name})\n"
++            f"  Stage : {self.current_stage}   Reason: {reason}\n"
++            f"  Episode: {self.global_episode}\n"
++            f"{'─' * 52}\n"
++        )
++
++    def _is_complete(self) -> bool:
++        """True if agent has finished the final protein in stage 4."""
++        max_stage = max(BY_STAGE.keys())
++        if self.current_stage < max_stage:
++            return False
++        return self.current_idx >= len(get_stage(max_stage)) - 1
++
++    # ── Status ────────────────────────────────────────────────
++
++    def status(self) -> str:
++        """One-line status string for console logging."""
++        p       = self.current_protein()
++        history = self.rmsd_history[p.pdb_id]
++        rolling = (sum(history) / len(history)) if history else float("inf")
++        return (
++            f"Stage {self.current_stage} | "
++            f"{p.pdb_id} | "
++            f"Rolling RMSD: {rolling:.3f}Å / gate {p.rmsd_gate}Å | "
++            f"Patience: {self.patience_counter}/{GATE_PATIENCE}"
++        )
++
++    def summary(self) -> str:
++        """Full formatted progress table."""
++        lines = [
++            "═" * 58,
++            "  ProteinFold-RL — Curriculum Progress",
++            "═" * 58,
++            f"  Global episodes : {self.global_episode}",
++            f"  Current stage   : {self.current_stage} / 4",
++            f"  Current protein : {self.current_protein().pdb_id}"
++            f" ({self.current_protein().name})",
++            "",
++            f"  {'PDB':6} {'N ep':6} {'Roll RMSD':10} {'Gate':6} {'Status'}",
++            "  " + "─" * 44,
++        ]
++        for p in REGISTRY:
++            hist = self.rmsd_history[p.pdb_id]
++            n    = self.episode_counts[p.pdb_id]
++            roll = (sum(hist) / len(hist)) if hist else float("inf")
++            if n == 0:
++                icon = "⬜"
++            elif roll < p.rmsd_gate and n >= MIN_EPISODES:
++                icon = "✅"
++            else:
++                icon = "🔄"
++            roll_str = f"{roll:.3f}" if roll < 999 else "  —  "
++            lines.append(
++                f"  {p.pdb_id:6} {n:6d} {roll_str:10} "
++                f"{p.rmsd_gate:6.1f} {icon}"
++            )
++        lines.append("═" * 58)
++        if self.advancement_log:
++            lines.append(f"\n  Advancements ({len(self.advancement_log)}):")
++            for a in self.advancement_log[-5:]:
++                lines.append(
++                    f"    Ep {a['global_episode']:5d}: "
++                    f"{a['from']} → {a['to']}  ({a['reason']})"
++                )
++        return "\n".join(lines)
++
++    # ── Serialization ─────────────────────────────────────────
++
++    def state_dict(self) -> dict:
++        """Return JSON-serializable state for checkpointing."""
++        return {
++            "current_stage"   : self.current_stage,
++            "current_idx"     : self.current_idx,
++            "global_episode"  : self.global_episode,
++            "patience_counter": self.patience_counter,
++            "episode_counts"  : dict(self.episode_counts),
++            "rmsd_history"    : {k: list(v)
++                                 for k, v in self.rmsd_history.items()},
++            "advancement_log" : self.advancement_log,
++        }
++
++    def load_state_dict(self, state: dict) -> None:
++        """Restore curriculum from a saved state dict."""
++        self.current_stage    = state["current_stage"]
++        self.current_idx      = state["current_idx"]
++        self.global_episode   = state["global_episode"]
++        self.patience_counter = state["patience_counter"]
++        self.episode_counts   = state["episode_counts"]
++        self.rmsd_history     = {
++            k: deque(v, maxlen=GATE_WINDOW)
++            for k, v in state["rmsd_history"].items()
++        }
++        self.advancement_log  = state["advancement_log"]
++
++    def save(self, path: str) -> None:
++        """Save curriculum state to a JSON file."""
++        os.makedirs(os.path.dirname(path), exist_ok=True)
++        with open(path, "w") as f:
++            json.dump(self.state_dict(), f, indent=2)
++        print(f"[CURRICULUM] Saved → {path}")
++
++    @classmethod
++    def load(cls, path: str) -> "ProteinCurriculum":
++        """Load curriculum state from a JSON file."""
++        c = cls()
++        with open(path) as f:
++            c.load_state_dict(json.load(f))
++        print(f"[CURRICULUM] Loaded ← {path}")
++        return c
++
++
++# ── Self-test ─────────────────────────────────────────────────
++
++if __name__ == "__main__":
++    import tempfile
++
++    print("=" * 52)
++    print("ProteinFold-RL — Curriculum Engine Test")
++    print("=" * 52)
++
++    # Test 1: starts on 1L2Y
++    c = ProteinCurriculum()
++    assert c.current_protein().pdb_id == "1L2Y", "Should start on 1L2Y"
++    print("\n[PASS] Starts on 1L2Y ✅")
++
++    # Test 2: gate not met with bad RMSD
++    for _ in range(MIN_EPISODES + GATE_WINDOW):
++        c.record("1L2Y", rmsd=9.0)
++    advanced, reason = c.maybe_advance()
++    assert not advanced, "Should not advance with bad RMSD"
++    print("[PASS] Does not advance on bad RMSD ✅")
++
++    # Test 3: gate met with good RMSD
++    c2 = ProteinCurriculum()
++    for _ in range(MIN_EPISODES):
++        c2.record("1L2Y", rmsd=9.0)
++    for _ in range(GATE_WINDOW):
++        c2.record("1L2Y", rmsd=2.0)   # well below gate of 3.5
++    advanced, reason = c2.maybe_advance()
++    assert advanced and reason == "gate", f"Expected gate, got ({advanced}, {reason})"
++    assert c2.current_protein().pdb_id == "1YRF", "Should advance to 1YRF"
++    print("[PASS] Gate advancement works → 1YRF ✅")
++
++    # Test 4: patience fallback
++    c3 = ProteinCurriculum()
++    for _ in range(GATE_PATIENCE):
++        c3.record("1L2Y", rmsd=9.0)
++    advanced, reason = c3.maybe_advance()
++    assert advanced and reason == "patience", \
++        f"Expected patience, got ({advanced}, {reason})"
++    print("[PASS] Patience fallback works ✅")
++
++    # Test 5: serialization round-trip
++    c4 = ProteinCurriculum()
++    for _ in range(15):
++        c4.record("1L2Y", rmsd=5.0)
++    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
++        tmp = f.name
++    c4.save(tmp)
++    c5 = ProteinCurriculum.load(tmp)
++    assert c5.global_episode   == c4.global_episode
++    assert c5.current_stage    == c4.current_stage
++    assert c5.patience_counter == c4.patience_counter
++    os.unlink(tmp)
++    print("[PASS] Serialization round-trip ✅")
++
++    # Test 6: sample_protein returns valid entries
++    import collections
++    c6 = ProteinCurriculum()
++    c6.current_stage = 2          # simulate stage 2 unlocked
++    samples = [c6.sample_protein().pdb_id for _ in range(100)]
++    counts  = collections.Counter(samples)
++    # Stage 2 proteins should appear more than stage 1
++    stage2  = {"1VII", "2GB1"}
++    stage1  = {"1L2Y", "1YRF"}
++    stage2_count = sum(counts[p] for p in stage2)
++    stage1_count = sum(counts[p] for p in stage1)
++    assert stage2_count > stage1_count, "Current stage should be sampled more"
++    print("[PASS] Replay sampling favours current stage ✅")
++
++    print()
++    print(c2.summary())
++
++    print("\n" + "=" * 52)
++    print("All curriculum tests passed.")
++    print("Next step: upgrade train.py")
++    print("=" * 52)
+\ No newline at end of file
+Index: frontend/index.html
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.BaseRevisionTextPatchEP
+<+><!DOCTYPE html>\r\n<html lang=\"en\">\r\n<head>\r\n  <meta charset=\"UTF-8\" />\r\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\r\n  <title>ProteinFold-RL — Discover the Journey</title>\r\n  <link rel=\"stylesheet\" href=\"assets/css/design-system.css\" />\r\n  <style>\r\n\r\n    /* ══════════════════════════════════════════\r\n       HERO\r\n    ══════════════════════════════════════════ */\r\n    .hero {\r\n      display: grid;\r\n      grid-template-columns: 1fr 380px;\r\n      align-items: center;\r\n      gap: 0;\r\n      padding: 3.5rem 2.5rem 3.5rem;\r\n      min-height: calc(100vh - 56px);\r\n      border-bottom: 0.5px solid var(--border);\r\n    }\r\n\r\n    .hero-left { display: flex; flex-direction: column; justify-content: center; }\r\n\r\n    .hero-eyebrow {\r\n      font-family: var(--mono);\r\n      font-size: 10px;\r\n      letter-spacing: 0.2em;\r\n      text-transform: uppercase;\r\n      color: var(--blue);\r\n      display: flex;\r\n      align-items: center;\r\n      gap: 12px;\r\n      margin-bottom: 2rem;\r\n    }\r\n    .hero-eyebrow::before {\r\n      content: '';\r\n      width: 24px; height: 0.5px;\r\n      background: var(--blue);\r\n      flex-shrink: 0;\r\n    }\r\n\r\n    .hero-h1 {\r\n      font-size: 3.2rem;\r\n      font-weight: 800;\r\n      line-height: 1.12;\r\n      letter-spacing: -0.02em;\r\n      color: #eaf4ff;\r\n      margin-bottom: 0.5rem;\r\n    }\r\n    .hero-h1-second {\r\n      font-size: 3.2rem;\r\n      font-weight: 800;\r\n      line-height: 1.12;\r\n      letter-spacing: -0.02em;\r\n      color: #eaf4ff;\r\n      margin-bottom: 2rem;\r\n    }\r\n    .hero-h1 .hl {\r\n      color: var(--blue);\r\n      position: relative;\r\n      display: inline-block;\r\n    }\r\n    .hero-h1-second .hl {\r\n      color: var(--teal);\r\n      display: inline-block;\r\n    }\r\n\r\n    .hero-divider {\r\n      width: 48px; height: 0.5px;\r\n      background: var(--border-hi);\r\n      margin-bottom: 2rem;\r\n    }\r\n\r\n    .hero-sub {\r\n      font-family: var(--mono);\r\n      font-size: 12px;\r\n      line-height: 2;\r\n      color: var(--text-dim);\r\n      margin-bottom: 2.5rem;\r\n      max-width: 440px;\r\n    }\r\n    .hero-sub strong { color: var(--text-mid); }\r\n\r\n    .cta-row { display: flex; gap: 12px; align-items: center; }\r\n\r\n    /* ── Protein Visual ── */\r\n    .hero-right {\r\n      display: flex;\r\n      flex-direction: column;\r\n      align-items: center;\r\n      justify-content: center;\r\n      gap: 1rem;\r\n      padding: 2rem;\r\n      border-left: 0.5px solid var(--border);\r\n      height: 100%;\r\n    }\r\n    .protein-label {\r\n      font-family: var(--mono);\r\n      font-size: 9px;\r\n      letter-spacing: 0.18em;\r\n      color: rgba(61,159,255,0.35);\r\n      text-transform: uppercase;\r\n      text-align: center;\r\n    }\r\n    .helix-svg { width: 260px; }\r\n\r\n    /* ── Hero bottom strip ── */\r\n    .hero-strip {\r\n      grid-column: 1 / -1;\r\n      display: grid;\r\n      grid-template-columns: repeat(4, 1fr);\r\n      border-top: 0.5px solid var(--border);\r\n      margin-top: 2rem;\r\n    }\r\n    .hero-strip-item {\r\n      padding: 1.25rem 1.5rem;\r\n      border-right: 0.5px solid var(--border);\r\n      display: flex;\r\n      flex-direction: column;\r\n      gap: 4px;\r\n    }\r\n    .hero-strip-item:last-child { border-right: none; }\r\n    .strip-val {\r\n      font-size: 1.5rem;\r\n      font-weight: 800;\r\n      color: #eaf4ff;\r\n      line-height: 1;\r\n    }\r\n    .strip-val .t { color: var(--teal); }\r\n    .strip-val .b { color: var(--blue); }\r\n    .strip-lbl {\r\n      font-family: var(--mono);\r\n      font-size: 9px;\r\n      letter-spacing: 0.12em;\r\n      text-transform: uppercase;\r\n      color: var(--text-dim);\r\n    }\r\n\r\n    /* ══════════════════════════════════════════\r\n       TICKER\r\n    ══════════════════════════════════════════ */\r\n    /* (from design-system.css) */\r\n\r\n    /* ══════════════════════════════════════════\r\n       SECTIONS\r\n    ══════════════════════════════════════════ */\r\n    .section { padding: 3.5rem 2.5rem; }\r\n    .section + .section { border-top: 0.5px solid var(--border); }\r\n\r\n    /* ══════════════════════════════════════════\r\n       RL LOOP\r\n    ══════════════════════════════════════════ */\r\n    .loop-grid {\r\n      display: grid;\r\n      grid-template-columns: repeat(4, 1fr);\r\n      border: 0.5px solid var(--border);\r\n    }\r\n    .loop-card {\r\n      padding: 1.75rem 1.5rem;\r\n      border-right: 0.5px solid var(--border);\r\n      background: var(--bg2);\r\n      position: relative;\r\n      transition: background 0.2s;\r\n    }\r\n    .loop-card:last-child { border-right: none; }\r\n    .loop-card:hover { background: var(--bg3); }\r\n    .loop-top-bar {\r\n      position: absolute;\r\n      top: 0; left: 0; right: 0;\r\n      height: 2px;\r\n      background: var(--ac);\r\n    }\r\n    .loop-idx {\r\n      font-family: var(--mono);\r\n      font-size: 9px;\r\n      letter-spacing: 0.14em;\r\n      color: var(--text-dim);\r\n      margin-bottom: 0.75rem;\r\n      text-transform: uppercase;\r\n      margin-top: 0.5rem;\r\n    }\r\n    .loop-title {\r\n      font-size: 1.05rem;\r\n      font-weight: 700;\r\n      color: #eaf4ff;\r\n      margin-bottom: 1rem;\r\n      padding-bottom: 0.75rem;\r\n      border-bottom: 0.5px solid var(--border);\r\n    }\r\n    .loop-row {\r\n      display: flex;\r\n      align-items: baseline;\r\n      gap: 8px;\r\n      margin-bottom: 6px;\r\n    }\r\n    .loop-key {\r\n      font-family: var(--mono);\r\n      font-size: 9px;\r\n      color: var(--text-dim);\r\n      letter-spacing: 0.08em;\r\n      flex-shrink: 0;\r\n    }\r\n    .loop-val {\r\n      font-family: var(--mono);\r\n      font-size: 10px;\r\n      font-weight: 700;\r\n      letter-spacing: 0.04em;\r\n    }\r\n    .c-b { color: var(--blue); }\r\n    .c-t { color: var(--teal); }\r\n    .c-r { color: var(--red); }\r\n    .c-a { color: var(--amber); }\r\n    .c-w { color: var(--text-mid); }\r\n\r\n    /* ══════════════════════════════════════════\r\n       COMPARISON\r\n    ══════════════════════════════════════════ */\r\n    .cmp-grid {\r\n      display: grid;\r\n      grid-template-columns: 1fr 1fr;\r\n      gap: 1px;\r\n      background: var(--border);\r\n      border: 0.5px solid var(--border);\r\n    }\r\n    .cmp-card {\r\n      padding: 2rem;\r\n      background: var(--bg2);\r\n    }\r\n    .cmp-header {\r\n      display: flex;\r\n      align-items: center;\r\n      justify-content: space-between;\r\n      margin-bottom: 1.5rem;\r\n    }\r\n    .cmp-title {\r\n      font-family: var(--mono);\r\n      font-size: 9px;\r\n      letter-spacing: 0.14em;\r\n      text-transform: uppercase;\r\n      color: var(--text-dim);\r\n    }\r\n    .cmp-badge {\r\n      font-family: var(--mono);\r\n      font-size: 9px;\r\n      padding: 3px 8px;\r\n      border: 0.5px solid rgba(61,159,255,0.2);\r\n      color: var(--blue);\r\n      letter-spacing: 0.08em;\r\n    }\r\n\r\n    .bar-group { margin-bottom: 1.5rem; }\r\n    .bar-row {\r\n      display: flex;\r\n      align-items: center;\r\n      gap: 12px;\r\n      margin-bottom: 8px;\r\n    }\r\n    .bar-name {\r\n      font-family: var(--mono);\r\n      font-size: 9px;\r\n      color: var(--text-dim);\r\n      width: 50px;\r\n      text-align: right;\r\n      flex-shrink: 0;\r\n      text-transform: uppercase;\r\n      letter-spacing: 0.06em;\r\n    }\r\n    .bar-track {\r\n      flex: 1;\r\n      height: 6px;\r\n      background: rgba(61,159,255,0.06);\r\n      position: relative;\r\n    }\r\n    .bar-fill {\r\n      position: absolute;\r\n      top: 0; left: 0; bottom: 0;\r\n      width: 0;\r\n      animation: bar-grow 1.6s ease forwards;\r\n      animation-delay: 0.4s;\r\n    }\r\n    @keyframes bar-grow { to { width: var(--w); } }\r\n    .bar-val {\r\n      font-family: var(--mono);\r\n      font-size: 10px;\r\n      font-weight: 700;\r\n      color: var(--text-mid);\r\n      width: 60px;\r\n      flex-shrink: 0;\r\n    }\r\n\r\n    .cmp-result {\r\n      padding-top: 1.25rem;\r\n      border-top: 0.5px solid var(--border);\r\n      display: flex;\r\n      align-items: baseline;\r\n      gap: 12px;\r\n    }\r\n    .cmp-big {\r\n      font-size: 2.2rem;\r\n      font-weight: 800;\r\n      color: var(--teal);\r\n      line-height: 1;\r\n    }\r\n    .cmp-sub {\r\n      font-family: var(--mono);\r\n      font-size: 10px;\r\n      color: rgba(0,212,170,0.5);\r\n    }\r\n\r\n    /* ══════════════════════════════════════════\r\n       STACK\r\n    ══════════════════════════════════════════ */\r\n    .stack-grid {\r\n      display: grid;\r\n      grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));\r\n      gap: 1px;\r\n      background: var(--border);\r\n      border: 0.5px solid var(--border);\r\n    }\r\n    .stack-item {\r\n      background: var(--bg2);\r\n      padding: 1rem 1.25rem;\r\n      display: flex;\r\n      flex-direction: column;\r\n      gap: 4px;\r\n      transition: background 0.15s;\r\n    }\r\n    .stack-item:hover { background: var(--bg3); }\r\n    .stack-name {\r\n      font-family: var(--mono);\r\n      font-size: 11px;\r\n      font-weight: 700;\r\n      color: var(--text-mid);\r\n      letter-spacing: 0.04em;\r\n    }\r\n    .stack-role {\r\n      font-family: var(--mono);\r\n      font-size: 9px;\r\n      color: var(--text-dim);\r\n      letter-spacing: 0.08em;\r\n    }\r\n\r\n    /* ══════════════════════════════════════════\r\n       RESPONSIVE\r\n    ══════════════════════════════════════════ */\r\n    @media (max-width: 960px) {\r\n      .hero {\r\n        grid-template-columns: 1fr;\r\n        min-height: auto;\r\n        padding: 2.5rem 1.5rem;\r\n      }\r\n      .hero-right { display: none; }\r\n      .hero-strip { grid-template-columns: 1fr 1fr; }\r\n      .hero-h1, .hero-h1-second { font-size: 2.4rem; }\r\n      .loop-grid { grid-template-columns: 1fr 1fr; }\r\n      .cmp-grid  { grid-template-columns: 1fr; }\r\n      .section   { padding: 2.5rem 1.5rem; }\r\n    }\r\n    @media (max-width: 560px) {\r\n      .hero-h1, .hero-h1-second { font-size: 1.9rem; }\r\n      .hero-strip { grid-template-columns: 1fr 1fr; }\r\n      .loop-grid  { grid-template-columns: 1fr; }\r\n    }\r\n  </style>\r\n</head>\r\n<body>\r\n\r\n<canvas id=\"stars-canvas\"></canvas>\r\n\r\n<div class=\"page\">\r\n\r\n  <!-- ══ NAV ══ -->\r\n  <nav class=\"nav\">\r\n    <a class=\"nav-logo\" href=\"index.html\">\r\n      <div class=\"nav-logo-dot\"></div>\r\n      PROTEINFOLD-RL\r\n    </a>\r\n    <ul class=\"nav-links\">\r\n      <a href=\"index.html\"     class=\"active\">Home</a>\r\n      <a href=\"dashboard.html\"              >Dashboard</a>\r\n      <a href=\"demo.html\"                   >Live Demo</a>\r\n      <a href=\"science.html\"                >Science</a>\r\n      <a href=\"compare.html\"                >Compare</a>\r\n    </ul>\r\n    <div class=\"nav-right\"></div>\r\n  </nav>\r\n\r\n  <!-- ══ HERO ══ -->\r\n  <section class=\"hero\">\r\n\r\n    <!-- Left: text -->\r\n    <div class=\"hero-left\">\r\n      <div class=\"hero-eyebrow\">\r\n        Reinforcement Learning + Graph Neural Networks · Computational Biology\r\n      </div>\r\n\r\n      <h1 class=\"hero-h1\">\r\n        AlphaFold shows the <span class=\"hl\">destination.</span>\r\n      </h1>\r\n      <h2 class=\"hero-h1-second\">\r\n        We discover the <span class=\"hl\">journey.</span>\r\n      </h2>\r\n\r\n      <div class=\"hero-divider\"></div>\r\n\r\n      <p class=\"hero-sub\">\r\n        An RL agent that learns <strong>how proteins fold</strong> —\r\n        not where they end up.<br>\r\n        Rewarded by the laws of chemistry. No human labels.<br>\r\n        <strong>Physics is the teacher.</strong>\r\n      </p>\r\n\r\n      <div class=\"cta-row\">\r\n        <a class=\"btn-primary\" href=\"dashboard.html\">View Dashboard</a>\r\n        <a class=\"btn-ghost\"   href=\"science.html\">How it works ↗</a>\r\n      </div>\r\n\r\n      <!-- Stats strip inside hero -->\r\n      <div class=\"hero-strip\">\r\n        <div class=\"hero-strip-item\">\r\n          <div class=\"strip-val\"><span class=\"t\">15.920</span> Å</div>\r\n          <div class=\"strip-lbl\">Trained avg RMSD</div>\r\n        </div>\r\n        <div class=\"hero-strip-item\">\r\n          <div class=\"strip-val\"><span class=\"b\">+62.8</span> kcal</div>\r\n          <div class=\"strip-lbl\">Energy gain</div>\r\n        </div>\r\n        <div class=\"hero-strip-item\">\r\n          <div class=\"strip-val\">500</div>\r\n          <div class=\"strip-lbl\">Episodes</div>\r\n        </div>\r\n        <div class=\"hero-strip-item\">\r\n          <div class=\"strip-val\"><span class=\"t\">−5.1%</span></div>\r\n          <div class=\"strip-lbl\">RMSD vs random</div>\r\n        </div>\r\n      </div>\r\n    </div>\r\n\r\n    <!-- Right: protein illustration -->\r\n    <div class=\"hero-right\">\r\n      <div class=\"protein-label\">Trp-cage · 1L2Y · 20 residues</div>\r\n      <svg class=\"helix-svg\" viewBox=\"0 0 260 460\" fill=\"none\"\r\n           xmlns=\"http://www.w3.org/2000/svg\">\r\n        <!-- Alpha helix -->\r\n        <text x=\"20\" y=\"28\" font-family=\"Space Mono,monospace\"\r\n              font-size=\"8\" fill=\"rgba(61,159,255,0.45)\"\r\n              letter-spacing=\"2\">α-HELIX</text>\r\n        <g opacity=\"0.85\">\r\n          <ellipse cx=\"130\" cy=\"55\"  rx=\"50\" ry=\"13\"\r\n                   stroke=\"#3d9fff\" stroke-width=\"1.2\" opacity=\"0.7\"/>\r\n          <ellipse cx=\"130\" cy=\"82\"  rx=\"54\" ry=\"13\"\r\n                   stroke=\"#3d9fff\" stroke-width=\"1.2\" opacity=\"0.62\"/>\r\n          <ellipse cx=\"130\" cy=\"109\" rx=\"52\" ry=\"13\"\r\n                   stroke=\"#3d9fff\" stroke-width=\"1.2\" opacity=\"0.54\"/>\r\n          <ellipse cx=\"130\" cy=\"136\" rx=\"50\" ry=\"13\"\r\n                   stroke=\"#3d9fff\" stroke-width=\"1.2\" opacity=\"0.46\"/>\r\n          <ellipse cx=\"130\" cy=\"163\" rx=\"52\" ry=\"13\"\r\n                   stroke=\"#3d9fff\" stroke-width=\"1.2\" opacity=\"0.38\"/>\r\n          <line x1=\"78\"  y1=\"55\" x2=\"78\"  y2=\"163\"\r\n                stroke=\"#3d9fff\" stroke-width=\"0.7\" opacity=\"0.2\"/>\r\n          <line x1=\"182\" y1=\"55\" x2=\"182\" y2=\"163\"\r\n                stroke=\"#3d9fff\" stroke-width=\"0.7\" opacity=\"0.2\"/>\r\n        </g>\r\n\r\n        <!-- Beta sheet -->\r\n        <text x=\"20\" y=\"218\" font-family=\"Space Mono,monospace\"\r\n              font-size=\"8\" fill=\"rgba(61,159,255,0.45)\"\r\n              letter-spacing=\"2\">β-SHEET</text>\r\n        <g opacity=\"0.62\">\r\n          <rect x=\"50\" y=\"226\" width=\"160\" height=\"10\" rx=\"2\"\r\n                fill=\"rgba(20,70,130,0.6)\" stroke=\"#3d9fff\" stroke-width=\"0.6\"/>\r\n          <rect x=\"50\" y=\"248\" width=\"160\" height=\"10\" rx=\"2\"\r\n                fill=\"rgba(20,70,130,0.6)\" stroke=\"#3d9fff\" stroke-width=\"0.6\"/>\r\n          <rect x=\"50\" y=\"270\" width=\"160\" height=\"10\" rx=\"2\"\r\n                fill=\"rgba(20,70,130,0.6)\" stroke=\"#3d9fff\" stroke-width=\"0.6\"/>\r\n          <polygon points=\"210,222 226,231 210,240\"\r\n                   fill=\"#3d9fff\" opacity=\"0.75\"/>\r\n          <polygon points=\"210,244 226,253 210,262\"\r\n                   fill=\"#3d9fff\" opacity=\"0.75\"/>\r\n          <polygon points=\"210,266 226,275 210,284\"\r\n                   fill=\"#3d9fff\" opacity=\"0.75\"/>\r\n        </g>\r\n\r\n        <!-- Loop -->\r\n        <text x=\"20\" y=\"340\" font-family=\"Space Mono,monospace\"\r\n              font-size=\"8\" fill=\"rgba(61,159,255,0.45)\"\r\n              letter-spacing=\"2\">LOOP</text>\r\n        <path d=\"M130 298 Q96 318 114 342 Q152 366 130 390\"\r\n              stroke=\"#3d9fff\" stroke-width=\"1.3\" fill=\"none\"\r\n              stroke-dasharray=\"5 3\" opacity=\"0.38\"/>\r\n\r\n        <!-- Cα nodes -->\r\n        <g fill=\"#3d9fff\">\r\n          <circle cx=\"130\" cy=\"46\"  r=\"3.5\" opacity=\"0.9\"/>\r\n          <circle cx=\"180\" cy=\"82\"  r=\"2.8\" opacity=\"0.8\"/>\r\n          <circle cx=\"80\"  cy=\"118\" r=\"2.8\" opacity=\"0.7\"/>\r\n          <circle cx=\"180\" cy=\"154\" r=\"2.8\" opacity=\"0.6\"/>\r\n          <circle cx=\"80\"  cy=\"163\" r=\"2.4\" opacity=\"0.5\"/>\r\n          <circle cx=\"114\" cy=\"342\" r=\"2.2\" opacity=\"0.45\"/>\r\n          <circle cx=\"130\" cy=\"390\" r=\"2\"   opacity=\"0.35\"/>\r\n        </g>\r\n\r\n        <!-- Graph edges -->\r\n        <g stroke=\"#3d9fff\" stroke-width=\"0.5\" opacity=\"0.12\">\r\n          <line x1=\"130\" y1=\"46\"  x2=\"180\" y2=\"82\"/>\r\n          <line x1=\"180\" y1=\"82\"  x2=\"80\"  y2=\"118\"/>\r\n          <line x1=\"80\"  y1=\"118\" x2=\"180\" y2=\"154\"/>\r\n        </g>\r\n\r\n        <!-- Energy label -->\r\n        <rect x=\"20\" y=\"415\" width=\"220\" height=\"32\" rx=\"2\"\r\n              fill=\"rgba(61,159,255,0.05)\" stroke=\"rgba(61,159,255,0.15)\"\r\n              stroke-width=\"0.5\"/>\r\n        <text x=\"32\" y=\"429\" font-family=\"Space Mono,monospace\"\r\n              font-size=\"8\" fill=\"rgba(61,159,255,0.4)\"\r\n              letter-spacing=\"1\">BEST ENERGY</text>\r\n        <text x=\"32\" y=\"441\" font-family=\"Space Mono,monospace\"\r\n              font-size=\"9\" fill=\"rgba(0,212,170,0.7)\"\r\n              font-weight=\"700\" letter-spacing=\"1\">54.430 kcal/mol</text>\r\n      </svg>\r\n      <div class=\"protein-label\">Cα graph · 8Å contact edges</div>\r\n    </div>\r\n\r\n  </section>\r\n\r\n  <!-- ══ TICKER ══ -->\r\n  <div class=\"ticker\">\r\n    <div class=\"ticker-track\" id=\"ticker-track\"></div>\r\n  </div>\r\n\r\n  <!-- ══ RL LOOP ══ -->\r\n  <section class=\"section\">\r\n    <div class=\"section-label\">RL system design — state · action · reward · policy</div>\r\n    <div class=\"loop-grid\">\r\n\r\n      <div class=\"loop-card\" style=\"--ac:var(--blue);\">\r\n        <div class=\"loop-top-bar\"></div>\r\n        <div class=\"loop-idx\">01 — State</div>\r\n        <div class=\"loop-title\">Protein Graph</div>\r\n        <div class=\"loop-row\">\r\n          <span class=\"loop-key\">Nodes</span>\r\n          <span class=\"loop-val c-b\">[N, 23] features</span>\r\n        </div>\r\n        <div class=\"loop-row\">\r\n          <span class=\"loop-key\">Edges</span>\r\n          <span class=\"loop-val c-w\">[E, 4] contacts</span>\r\n        </div>\r\n        <div class=\"loop-row\">\r\n          <span class=\"loop-key\">Cutoff</span>\r\n          <span class=\"loop-val c-w\">8 Å distance</span>\r\n        </div>\r\n        <div class=\"loop-row\">\r\n          <span class=\"loop-key\">Extra</span>\r\n          <span class=\"loop-val c-w\">energy history ×5</span>\r\n        </div>\r\n      </div>\r\n\r\n      <div class=\"loop-card\" style=\"--ac:var(--teal);\">\r\n        <div class=\"loop-top-bar\"></div>\r\n        <div class=\"loop-idx\">02 — Action</div>\r\n        <div class=\"loop-title\">Dihedral Angles</div>\r\n        <div class=\"loop-row\">\r\n          <span class=\"loop-key\">Space</span>\r\n          <span class=\"loop-val c-t\">N × 2 × 12</span>\r\n        </div>\r\n        <div class=\"loop-row\">\r\n          <span class=\"loop-key\">Angles</span>\r\n          <span class=\"loop-val c-w\">φ / ψ backbone</span>\r\n        </div>\r\n        <div class=\"loop-row\">\r\n          <span class=\"loop-key\">Step</span>\r\n          <span class=\"loop-val c-w\">30° per increment</span>\r\n        </div>\r\n        <div class=\"loop-row\">\r\n          <span class=\"loop-key\">Chain</span>\r\n          <span class=\"loop-val c-w\">NeRF kinematics</span>\r\n        </div>\r\n      </div>\r\n\r\n      <div class=\"loop-card\" style=\"--ac:var(--red);\">\r\n        <div class=\"loop-top-bar\"></div>\r\n        <div class=\"loop-idx\">03 — Reward</div>\r\n        <div class=\"loop-title\">Physics Signal</div>\r\n        <div class=\"loop-row\">\r\n          <span class=\"loop-key\">Big drop</span>\r\n          <span class=\"loop-val c-t\">+8.0</span>\r\n        </div>\r\n        <div class=\"loop-row\">\r\n          <span class=\"loop-key\">Small drop</span>\r\n          <span class=\"loop-val c-b\">+2.0</span>\r\n        </div>\r\n        <div class=\"loop-row\">\r\n          <span class=\"loop-key\">RMSD &lt;2Å</span>\r\n          <span class=\"loop-val c-t\">+15.0 bonus</span>\r\n        </div>\r\n        <div class=\"loop-row\">\r\n          <span class=\"loop-key\">Clash</span>\r\n          <span class=\"loop-val c-r\">−2.0</span>\r\n        </div>\r\n        <div class=\"loop-row\">\r\n          <span class=\"loop-key\">Step</span>\r\n          <span class=\"loop-val c-r\">−0.3 penalty</span>\r\n        </div>\r\n      </div>\r\n\r\n      <div class=\"loop-card\" style=\"--ac:var(--amber);\">\r\n        <div class=\"loop-top-bar\"></div>\r\n        <div class=\"loop-idx\">04 — Policy</div>\r\n        <div class=\"loop-title\">GNN + PPO</div>\r\n        <div class=\"loop-row\">\r\n          <span class=\"loop-key\">Encoder</span>\r\n          <span class=\"loop-val c-w\">23 → 128 dim</span>\r\n        </div>\r\n        <div class=\"loop-row\">\r\n          <span class=\"loop-key\">MPNN</span>\r\n          <span class=\"loop-val c-a\">4 layers → 256d</span>\r\n        </div>\r\n        <div class=\"loop-row\">\r\n          <span class=\"loop-key\">PPO ε</span>\r\n          <span class=\"loop-val c-w\">0.2 clip</span>\r\n        </div>\r\n        <div class=\"loop-row\">\r\n          <span class=\"loop-key\">GAE λ</span>\r\n          <span class=\"loop-val c-w\">0.95</span>\r\n        </div>\r\n        <div class=\"loop-row\">\r\n          <span class=\"loop-key\">LR</span>\r\n          <span class=\"loop-val c-w\">3e-4 AdamW</span>\r\n        </div>\r\n      </div>\r\n\r\n    </div>\r\n  </section>\r\n\r\n  <!-- ══ COMPARISON ══ -->\r\n  <section class=\"section\" style=\"padding-top:0;\">\r\n    <div class=\"section-label\">\r\n      evaluation — Trp-cage 1L2Y · 20 episodes each · trained vs random\r\n    </div>\r\n    <div class=\"cmp-grid\">\r\n\r\n      <div class=\"cmp-card\">\r\n        <div class=\"cmp-header\">\r\n          <div class=\"cmp-title\">Average RMSD — lower is better</div>\r\n          <div class=\"cmp-badge\">Å</div>\r\n        </div>\r\n        <div class=\"bar-group\">\r\n          <div class=\"bar-row\">\r\n            <div class=\"bar-name\">Random</div>\r\n            <div class=\"bar-track\">\r\n              <div class=\"bar-fill\"\r\n                   style=\"--w:100%; background:var(--red);\"></div>\r\n            </div>\r\n            <div class=\"bar-val\">16.775 Å</div>\r\n          </div>\r\n          <div class=\"bar-row\">\r\n            <div class=\"bar-name\">Trained</div>\r\n            <div class=\"bar-track\">\r\n              <div class=\"bar-fill\"\r\n                   style=\"--w:95%; background:var(--blue);\"></div>\r\n            </div>\r\n            <div class=\"bar-val\">15.920 Å</div>\r\n          </div>\r\n        </div>\r\n        <div class=\"cmp-result\">\r\n          <div class=\"cmp-big\">−5.1%</div>\r\n          <div class=\"cmp-sub\">RMSD reduction<br>vs random baseline</div>\r\n        </div>\r\n      </div>\r\n\r\n      <div class=\"cmp-card\">\r\n        <div class=\"cmp-header\">\r\n          <div class=\"cmp-title\">Average energy — lower is better</div>\r\n          <div class=\"cmp-badge\">kcal/mol</div>\r\n        </div>\r\n        <div class=\"bar-group\">\r\n          <div class=\"bar-row\">\r\n            <div class=\"bar-name\">Random</div>\r\n            <div class=\"bar-track\">\r\n              <div class=\"bar-fill\"\r\n                   style=\"--w:100%; background:var(--red);\"></div>\r\n            </div>\r\n            <div class=\"bar-val\">117.258 kcal</div>\r\n          </div>\r\n          <div class=\"bar-row\">\r\n            <div class=\"bar-name\">Trained</div>\r\n            <div class=\"bar-track\">\r\n              <div class=\"bar-fill\"\r\n                   style=\"--w:46%; background:var(--blue);\"></div>\r\n            </div>\r\n            <div class=\"bar-val\">54.430 kcal</div>\r\n          </div>\r\n        </div>\r\n        <div class=\"cmp-result\">\r\n          <div class=\"cmp-big\">+62.8</div>\r\n          <div class=\"cmp-sub\">kcal/mol improvement<br>over random agent</div>\r\n        </div>\r\n      </div>\r\n\r\n    </div>\r\n  </section>\r\n\r\n  <!-- ══ PASS BADGE ══ -->\r\n  <div class=\"pass-row\">\r\n    <div class=\"pass-dot\"></div>\r\n    <div class=\"pass-text\">\r\n      [PASS] · Trained agent outperforms random on all metrics ·\r\n      Energy improvement −62.8 kcal/mol (−53.6%) · RMSD improvement −0.855 Å (−5.1%) ·\r\n      CHECKPOINT-07 COMPLETE\r\n    </div>\r\n  </div>\r\n\r\n  <!-- ══ TECH STACK ══ -->\r\n  <section class=\"section\">\r\n    <div class=\"section-label\">technology stack</div>\r\n    <div class=\"stack-grid\">\r\n      <div class=\"stack-item\">\r\n        <div class=\"stack-name\">PyTorch 2.6</div>\r\n        <div class=\"stack-role\">Deep learning</div>\r\n      </div>\r\n      <div class=\"stack-item\">\r\n        <div class=\"stack-name\">PyG 2.7</div>\r\n        <div class=\"stack-role\">Graph neural nets</div>\r\n      </div>\r\n      <div class=\"stack-item\">\r\n        <div class=\"stack-name\">Gymnasium</div>\r\n        <div class=\"stack-role\">RL environment</div>\r\n      </div>\r\n      <div class=\"stack-item\">\r\n        <div class=\"stack-name\">BioPython</div>\r\n        <div class=\"stack-role\">PDB parsing</div>\r\n      </div>\r\n      <div class=\"stack-item\">\r\n        <div class=\"stack-name\">FastAPI</div>\r\n        <div class=\"stack-role\">REST backend</div>\r\n      </div>\r\n      <div class=\"stack-item\">\r\n        <div class=\"stack-name\">Gradio</div>\r\n        <div class=\"stack-role\">Live demo UI</div>\r\n      </div>\r\n      <div class=\"stack-item\">\r\n        <div class=\"stack-name\">PPO-clip</div>\r\n        <div class=\"stack-role\">RL algorithm</div>\r\n      </div>\r\n      <div class=\"stack-item\">\r\n        <div class=\"stack-name\">NeRF kinematics</div>\r\n        <div class=\"stack-role\">Chain propagation</div>\r\n      </div>\r\n      <div class=\"stack-item\">\r\n        <div class=\"stack-name\">Lennard-Jones</div>\r\n        <div class=\"stack-role\">Energy function</div>\r\n      </div>\r\n      <div class=\"stack-item\">\r\n        <div class=\"stack-name\">MPNN × 4</div>\r\n        <div class=\"stack-role\">Message passing</div>\r\n      </div>\r\n      <div class=\"stack-item\">\r\n        <div class=\"stack-name\">1L2Y Trp-cage</div>\r\n        <div class=\"stack-role\">20 residue protein</div>\r\n      </div>\r\n      <div class=\"stack-item\">\r\n        <div class=\"stack-name\">1YRF Villin</div>\r\n        <div class=\"stack-role\">35 residue protein</div>\r\n      </div>\r\n    </div>\r\n  </section>\r\n\r\n  <!-- ══ FOOTER ══ -->\r\n  <footer class=\"footer\">\r\n    <div class=\"footer-l\">\r\n      ProteinFold-RL · NIT Delhi · Open Innovation Track · 2025\r\n    </div>\r\n    <div class=\"footer-r\">index.html · page 1 of 5</div>\r\n  </footer>\r\n\r\n</div>\r\n\r\n<script src=\"assets/js/stars.js\"></script>\r\n<script src=\"assets/js/ticker.js\"></script>\r\n<script>\r\n  initStarfield();\r\n  initTicker();\r\n</script>\r\n\r\n</body>\r\n</html>
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/frontend/index.html b/frontend/index.html
+--- a/frontend/index.html	(revision 71456e9b6125c185e2860ce677a90484ef9d4150)
++++ b/frontend/index.html	(date 1777142595987)
+@@ -382,6 +382,7 @@
+       <a href="demo.html"                   >Live Demo</a>
+       <a href="science.html"                >Science</a>
+       <a href="compare.html"                >Compare</a>
++        <a href="critical.html"              >Critical Points</a>
+     </ul>
+     <div class="nav-right"></div>
+   </nav>
+Index: env/protein_graph.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/env/protein_graph.py b/env/protein_graph.py
+--- a/env/protein_graph.py	(revision 71456e9b6125c185e2860ce677a90484ef9d4150)
++++ b/env/protein_graph.py	(date 1777138822533)
+@@ -1,0 +1,158 @@
++import numpy as np
++import torch
++from torch_geometric.data import Data
++from Bio import PDB
++from Bio.PDB import PPBuilder
++import warnings
++warnings.filterwarnings("ignore")
++
++# 20 standard amino acids
++AA_LIST = [
++    'ALA','ARG','ASN','ASP','CYS','GLN','GLU','GLY','HIS','ILE',
++    'LEU','LYS','MET','PHE','PRO','SER','THR','TRP','TYR','VAL'
++]
++AA_TO_IDX = {aa: i for i, aa in enumerate(AA_LIST)}
++CONTACT_THRESHOLD = 8.0  # Angstroms
++
++
++def one_hot_aa(resname: str) -> list:
++    vec = [0.0] * 20
++    idx = AA_TO_IDX.get(resname.upper(), -1)
++    if idx >= 0:
++        vec[idx] = 1.0
++    return vec
++
++
++def get_backbone_angles(residue) -> list:
++    """Extract phi/psi angles — return [0,0] if not computable."""
++    try:
++        phi = residue.internal_coord.get_angle("phi") or 0.0
++        psi = residue.internal_coord.get_angle("psi") or 0.0
++        return [
++            np.sin(np.radians(phi)),
++            np.cos(np.radians(phi)),
++            np.sin(np.radians(psi)),
++            np.cos(np.radians(psi))
++        ]
++    except Exception:
++        return [0.0, 0.0, 0.0, 0.0]
++
++
++def pdb_to_graph(pdb_path: str, model_idx: int = 0) -> Data:
++    """
++    Convert a PDB file to a PyTorch Geometric Data object.
++
++    Node features (23-dim):
++        - 20-dim one-hot amino acid type
++        - 3-dim Cα coordinates (x, y, z)
++
++    Edge features (4-dim):
++        - distance between Cα atoms
++        - sin/cos of relative orientation (dx, dy normalized)
++        - 1-dim peptide bond flag (1 = sequential neighbor)
++
++    Returns:
++        torch_geometric.data.Data with:
++            x          : [N, 23]  node features
++            edge_index : [2, E]   edge connectivity
++            edge_attr  : [E, 4]   edge features
++            pos        : [N, 3]   Cα coordinates
++            seq        : list of residue names
++    """
++    parser = PDB.PDBParser(QUIET=True)
++    structure = parser.get_structure("protein", pdb_path)
++    model = list(structure.get_models())[model_idx]
++
++    residues = []
++    ca_coords = []
++
++    for chain in model:
++        for residue in chain:
++            if residue.get_id()[0] != " ":
++                continue  # skip HETATMs
++            if "CA" not in residue:
++                continue  # skip residues without Cα
++            residues.append(residue)
++            ca_coords.append(residue["CA"].get_vector().get_array())
++
++    N = len(residues)
++    assert N > 0, f"No valid residues found in {pdb_path}"
++
++    ca_coords = np.array(ca_coords, dtype=np.float32)  # [N, 3]
++
++    # ── Node features ──────────────────────────────────────────
++    node_feats = []
++    for i, res in enumerate(residues):
++        aa_oh = one_hot_aa(res.get_resname())       # 20-dim
++        coord = ca_coords[i].tolist()               # 3-dim
++        node_feats.append(aa_oh + coord)            # 23-dim
++
++    x = torch.tensor(node_feats, dtype=torch.float)  # [N, 23]
++
++    # ── Edges — spatial contacts within 8Å ────────────────────
++    edge_src, edge_dst, edge_attrs = [], [], []
++
++    for i in range(N):
++        for j in range(N):
++            if i == j:
++                continue
++            diff = ca_coords[j] - ca_coords[i]
++            dist = float(np.linalg.norm(diff))
++
++            if dist <= CONTACT_THRESHOLD:
++                is_peptide = 1.0 if abs(i - j) == 1 else 0.0
++                diff_norm = diff / (dist + 1e-8)
++
++                edge_src.append(i)
++                edge_dst.append(j)
++                edge_attrs.append([
++                    dist,
++                    float(diff_norm[0]),
++                    float(diff_norm[1]),
++                    is_peptide
++                ])
++
++    edge_index = torch.tensor(
++        [edge_src, edge_dst], dtype=torch.long
++    )  # [2, E]
++
++    edge_attr = torch.tensor(
++        edge_attrs, dtype=torch.float
++    )  # [E, 4]
++
++    pos = torch.tensor(ca_coords, dtype=torch.float)  # [N, 3]
++    seq = [r.get_resname() for r in residues]
++
++    data = Data(
++        x=x,
++        edge_index=edge_index,
++        edge_attr=edge_attr,
++        pos=pos,
++        seq=seq,
++        num_nodes=N
++    )
++
++    return data
++
++
++if __name__ == "__main__":
++    import os
++
++    for pdb_id, name in [("1L2Y", "Trp-cage"), ("1YRF", "Villin")]:
++        path = os.path.join(
++            os.path.dirname(__file__),
++            f"../data/structures/{pdb_id}.pdb"
++        )
++        print(f"\n[TEST] {name} ({pdb_id})")
++        graph = pdb_to_graph(path)
++        print(f"  Residues (nodes) : {graph.num_nodes}")
++        print(f"  Edges            : {graph.edge_index.shape[1]}")
++        print(f"  Node feat shape  : {graph.x.shape}")
++        print(f"  Edge feat shape  : {graph.edge_attr.shape}")
++        print(f"  Pos shape        : {graph.pos.shape}")
++        assert graph.x.shape[1] == 23,      "Node features must be 23-dim"
++        assert graph.edge_attr.shape[1] == 4, "Edge features must be 4-dim"
++        assert graph.edge_index.shape[0] == 2, "Edge index must be [2, E]"
++        print(f"  [PASS] All shape assertions passed ✓")
++
++    print("\nCHECKPOINT-01 — Protein graphs ready.")
+\ No newline at end of file
+Index: eval.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/eval.py b/eval.py
+--- a/eval.py	(revision 71456e9b6125c185e2860ce677a90484ef9d4150)
++++ b/eval.py	(date 1777141733128)
+@@ -1,0 +1,256 @@
++"""
++eval.py
++ProteinFold-RL — Evaluation (v2)
++
++What changed vs v1
++------------------
++- Policy loaded at MAX_ACTION_DIM (matches new train.py)
++- Action clamped to protein's valid range (same as train.py)
++- Saves a full eval_results.json for the dashboard to read
++- Cleaner pass/fail output with improvement percentages
++- Works with any protein in the registry, not just 1L2Y
++
++Run
++---
++  python eval.py                    # evaluate on 1L2Y (default)
++  python eval.py --protein 1YRF    # evaluate on any registered protein
++  python eval.py --episodes 30     # more episodes for better statistics
++"""
++
++import argparse
++import csv
++import json
++import os
++import sys
++
++import numpy as np
++import torch
++
++sys.path.insert(0, os.path.dirname(__file__))
++
++from env.fold_env import FoldEnv
++from model.gnn_policy import GNNPolicyNetwork
++from agent.ppo import PPOTrainer
++from config import MAX_ACTION_DIM, CHECKPOINT_PATH
++
++# ── Config ────────────────────────────────────────────────────
++CHECKPOINT = CHECKPOINT_PATH
++EVAL_EPISODES  = 20
++
++
++os.makedirs("logs", exist_ok=True)
++
++
++# ── Helpers ───────────────────────────────────────────────────
++
++def compute_rmsd(coords: np.ndarray, native: np.ndarray) -> float:
++    """Root-mean-square deviation of Cα coordinates."""
++    diff = coords - native
++    return float(np.sqrt(np.mean(np.sum(diff ** 2, axis=1))))
++
++
++def run_episode(env: FoldEnv, policy: GNNPolicyNetwork,
++                deterministic: bool = False) -> tuple:
++    """
++    Run one full episode with the trained policy.
++
++    Returns
++    -------
++    trajectory : list of per-step dicts
++    rmsd       : final RMSD vs native (Å)
++    energy     : final energy (kcal/mol)
++    """
++    obs, info = env.reset()
++    trajectory = []
++    done = False
++    prev_energy = info["energy"]
++
++    while not done:
++        graph = env.get_graph()
++        with torch.no_grad():
++            action, _, _, _ = policy.get_action(
++                graph, deterministic=deterministic
++            )
++        # Clamp to this protein's valid action range
++        action = action % env.action_dim
++
++        obs, reward, terminated, truncated, info = env.step(action)
++        done = terminated or truncated
++
++        step_rmsd     = compute_rmsd(env.ca_coords, env.native_coords)
++        energy_delta  = round(info["energy"] - prev_energy, 4)
++        prev_energy   = info["energy"]
++
++        trajectory.append({
++            "step"        : info["step"],
++            "energy"      : info["energy"],
++            "energy_delta": energy_delta,
++            "rmsd"        : round(step_rmsd, 4),
++            "has_clash"   : info["has_clash"],
++            "reward"      : reward,
++            "coords"      : env.ca_coords.copy(),
++        })
++
++    rmsd = compute_rmsd(env.ca_coords, env.native_coords)
++    return trajectory, rmsd, info["energy"]
++
++
++def run_random_episode(env: FoldEnv) -> tuple:
++    """Run one full episode with a random agent."""
++    obs, info = env.reset()
++    done = False
++    while not done:
++        action = env.action_space.sample()
++        obs, reward, terminated, truncated, info = env.step(action)
++        done = terminated or truncated
++    rmsd = compute_rmsd(env.ca_coords, env.native_coords)
++    return rmsd, info["energy"]
++
++
++# ── Main evaluation ───────────────────────────────────────────
++
++def evaluate(pdb_id: str = "1L2Y", n_episodes: int = EVAL_EPISODES):
++    print("=" * 62)
++    print("ProteinFold-RL — Evaluation v2")
++    print(f"  Protein  : {pdb_id}")
++    print(f"  Episodes : {n_episodes} each (trained + random)")
++    print(f"  Checkpoint: {CHECKPOINT}")
++    print("=" * 62)
++
++    # ── Setup ─────────────────────────────────────────────────
++    if not os.path.exists(CHECKPOINT):
++        print(f"\n[ERROR] No checkpoint found at {CHECKPOINT}")
++        print("  Run train.py first.")
++        sys.exit(1)
++
++    env    = FoldEnv(pdb_id=pdb_id)
++    policy = GNNPolicyNetwork(action_dim=MAX_ACTION_DIM)
++    trainer= PPOTrainer(policy=policy, action_dim=MAX_ACTION_DIM)
++    trainer.load(CHECKPOINT)
++    policy.eval()
++
++    # ── Random baseline ───────────────────────────────────────
++    print(f"\n[BASELINE] Random agent ({n_episodes} episodes)...")
++    random_rmsds, random_energies = [], []
++
++    for _ in range(n_episodes):
++        rmsd, energy = run_random_episode(env)
++        random_rmsds.append(rmsd)
++        random_energies.append(energy)
++
++    r_rmsd_mean   = float(np.mean(random_rmsds))
++    r_energy_mean = float(np.mean(random_energies))
++    print(f"  Avg RMSD   : {r_rmsd_mean:.3f} Å")
++    print(f"  Avg Energy : {r_energy_mean:.3f} kcal/mol")
++
++    # ── Trained agent ─────────────────────────────────────────
++    print(f"\n[TRAINED] Policy agent ({n_episodes} episodes)...")
++    policy_rmsds, policy_energies = [], []
++    best_rmsd = float("inf")
++    best_traj = None
++
++    for ep in range(n_episodes):
++        traj, rmsd, energy = run_episode(env, policy, deterministic=False)
++        policy_rmsds.append(rmsd)
++        policy_energies.append(energy)
++        if rmsd < best_rmsd:
++            best_rmsd = rmsd
++            best_traj = traj
++
++    p_rmsd_mean   = float(np.mean(policy_rmsds))
++    p_energy_mean = float(np.mean(policy_energies))
++    print(f"  Avg RMSD   : {p_rmsd_mean:.3f} Å")
++    print(f"  Avg Energy : {p_energy_mean:.3f} kcal/mol")
++    print(f"  Best RMSD  : {best_rmsd:.3f} Å")
++
++    # ── Comparison ────────────────────────────────────────────
++    print("\n[COMPARISON]")
++    rmsd_imp   = r_rmsd_mean   - p_rmsd_mean
++    energy_imp = r_energy_mean - p_energy_mean
++    rmsd_pct   = 100 * rmsd_imp   / (r_rmsd_mean   + 1e-8)
++    energy_pct = 100 * energy_imp / (r_energy_mean + 1e-8)
++
++    print(f"  RMSD improvement   : {rmsd_imp:+.3f} Å  ({rmsd_pct:+.1f}%)")
++    print(f"  Energy improvement : {energy_imp:+.3f} kcal/mol  ({energy_pct:+.1f}%)")
++
++    passed = p_energy_mean < r_energy_mean
++    if passed:
++        print("  [PASS] Trained agent outperforms random baseline ✅")
++    else:
++        print("  [WARN] Trained agent did not outperform random.")
++        print("         Try training for more episodes.")
++
++    # ── Save best trajectory ──────────────────────────────────
++    traj_path = "logs/best_trajectory.csv"
++    with open(traj_path, "w", newline="") as f:
++        writer = csv.writer(f)
++        writer.writerow(["step", "energy", "energy_delta", "rmsd", "reward", "has_clash"])
++        for t in best_traj:
++            writer.writerow([
++                t["step"],
++                round(t["energy"],       4),
++                round(t["energy_delta"], 4),
++                round(t["rmsd"],         4),
++                round(t["reward"],       4),
++                int(t["has_clash"]),
++            ])
++    print(f"\n  Best trajectory → {traj_path}")
++
++    # ── Save coords ───────────────────────────────────────────
++    np.save("logs/native_coords.npy",  env.native_coords)
++    np.save("logs/best_coords.npy",    best_traj[-1]["coords"])
++    np.save("logs/initial_coords.npy", best_traj[0]["coords"])
++    print(f"  Coords → logs/")
++
++    # ── Save eval_results.json (dashboard reads this) ─────────
++    results = {
++        "protein"          : pdb_id,
++        "n_episodes"       : n_episodes,
++        "random": {
++            "avg_rmsd"     : round(r_rmsd_mean,   3),
++            "avg_energy"   : round(r_energy_mean, 3),
++        },
++        "trained": {
++            "avg_rmsd"     : round(p_rmsd_mean,   3),
++            "avg_energy"   : round(p_energy_mean, 3),
++            "best_rmsd"    : round(best_rmsd,      3),
++        },
++        "improvement": {
++            "rmsd_abs"     : round(rmsd_imp,   3),
++            "rmsd_pct"     : round(rmsd_pct,   1),
++            "energy_abs"   : round(energy_imp, 3),
++            "energy_pct"   : round(energy_pct, 1),
++        },
++        "passed"           : passed,
++    }
++
++    results_path = "logs/eval_results.json"
++    with open(results_path, "w") as f:
++        json.dump(results, f, indent=2)
++    print(f"  Eval results → {results_path}")
++
++    # ── Final summary ─────────────────────────────────────────
++    print("\n" + "=" * 62)
++    print("Evaluation Complete")
++    print(f"  Random  → RMSD {r_rmsd_mean:.3f} Å | Energy {r_energy_mean:.3f}")
++    print(f"  Trained → RMSD {p_rmsd_mean:.3f} Å | Energy {p_energy_mean:.3f}")
++    print(f"  Improvement: {rmsd_imp:+.3f} Å  |  {energy_imp:+.3f} kcal/mol")
++    print("=" * 62)
++
++    return results
++
++
++# ── CLI ───────────────────────────────────────────────────────
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser()
++    parser.add_argument(
++        "--protein", type=str, default="1L2Y",
++        help="PDB ID to evaluate on (default: 1L2Y)"
++    )
++    parser.add_argument(
++        "--episodes", type=int, default=EVAL_EPISODES,
++        help=f"Episodes per agent (default: {EVAL_EPISODES})"
++    )
++    args = parser.parse_args()
++    evaluate(pdb_id=args.protein, n_episodes=args.episodes)
+\ No newline at end of file
+Index: env/fold_env.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/env/fold_env.py b/env/fold_env.py
+--- a/env/fold_env.py	(revision 71456e9b6125c185e2860ce677a90484ef9d4150)
++++ b/env/fold_env.py	(date 1777138758656)
+@@ -1,0 +1,440 @@
++import numpy as np
++import torch
++import gymnasium as gym
++from gymnasium import spaces
++from torch_geometric.data import Data
++import os
++import sys
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from env.protein_graph import pdb_to_graph
++from env.energy import compute_energy, compute_energy_delta
++from env.clash_detect import detect_clashes, is_valid_conformation
++
++# ── Reward constants ─────────────────────────────────────────
++R_ENERGY_BIG    = +8.0
++R_ENERGY_SMALL  = +2.0
++R_NO_CLASH      = +1.0
++R_CLASH         = -2.0
++R_ENERGY_UP     = -1.0
++R_STEP_PENALTY  = -0.3
++R_RMSD_BONUS    = +15.0
++RMSD_THRESHOLD  =  2.0   # Angstroms
++
++# ── Secondary structure reward constants ─────────────────────
++R_SS_HELIX      = +0.3
++R_SS_SHEET      = +0.3
++R_SS_DISALLOWED = -0.1
++
++# ── Action space constants ───────────────────────────────────
++N_ANGLES        = 2      # phi, psi
++N_INCREMENTS    = 12     # 30° each
++ANGLE_STEP      = np.radians(30.0)
++ENERGY_DROP_BIG = 1.0    # kcal/mol threshold for big reward
++
++# ── Episode constants ────────────────────────────────────────
++MAX_STEPS       = 50
++MAX_CLASHES     = 5
++ENERGY_CONVERGE = 0.01   # kcal/mol — convergence threshold
++
++
++
++PDB_PATHS = {
++    "1L2Y": os.path.join(os.path.dirname(__file__), "../data/structures/1L2Y.pdb"),
++    "1YRF": os.path.join(os.path.dirname(__file__), "../data/structures/1YRF.pdb"),
++    "1VII": os.path.join(os.path.dirname(__file__), "../data/structures/1VII.pdb"),
++    "2GB1": os.path.join(os.path.dirname(__file__), "../data/structures/2GB1.pdb"),
++    "1ENH": os.path.join(os.path.dirname(__file__), "../data/structures/1ENH.pdb"),
++    "1UBQ": os.path.join(os.path.dirname(__file__), "../data/structures/1UBQ.pdb"),
++    "1BDD": os.path.join(os.path.dirname(__file__), "../data/structures/1BDD.pdb"),
++    "2HHB": os.path.join(os.path.dirname(__file__), "../data/structures/2HHB.pdb"),
++}
++
++
++class FoldEnv(gym.Env):
++    """
++    ProteinFold-RL Gymnasium Environment.
++
++    The agent sequentially adjusts backbone dihedral angles (phi/psi)
++    of a protein, rewarded by physics-based energy reduction.
++
++    Observation : dict with PyG graph + step info + energy buffer
++    Action      : Discrete(N_residues * 2 * 12)
++                  = choose residue × angle type × increment direction
++    """
++
++    metadata = {"render_modes": ["human"]}
++
++    def __init__(self, pdb_id: str = "1L2Y", render_mode=None):
++        super().__init__()
++        assert pdb_id in PDB_PATHS, f"Unknown PDB ID: {pdb_id}"
++
++        self.pdb_id      = pdb_id
++        self.render_mode = render_mode
++
++        # Load native structure once
++        self.native_graph  = pdb_to_graph(PDB_PATHS[pdb_id])
++        self.native_coords = self.native_graph.pos.numpy().copy()
++        self.N             = self.native_graph.num_nodes
++
++        # Action space
++        self.action_dim = self.N * N_ANGLES * N_INCREMENTS
++        self.action_space = spaces.Discrete(self.action_dim)
++
++        # Observation space — flat box for gym compatibility
++        # (actual graph passed separately to GNN)
++        node_dim = 23
++        self.observation_space = spaces.Dict({
++            "node_features" : spaces.Box(
++                low=-np.inf, high=np.inf,
++                shape=(self.N, node_dim), dtype=np.float32
++            ),
++            "ca_coords"     : spaces.Box(
++                low=-np.inf, high=np.inf,
++                shape=(self.N, 3), dtype=np.float32
++            ),
++            "step"          : spaces.Box(
++                low=0, high=MAX_STEPS,
++                shape=(1,), dtype=np.float32
++            ),
++            "energy_history": spaces.Box(
++                low=-np.inf, high=np.inf,
++                shape=(5,), dtype=np.float32
++            ),
++        })
++
++        # State variables (initialized in reset)
++        self.ca_coords     = None
++        self.phi_angles    = None
++        self.psi_angles    = None
++        self.current_energy= None
++        self.energy_history= None
++        self.step_count    = None
++        self.clash_count   = None
++        self.graph         = None
++
++    # ────────────────────────────────────────────────────────
++    def reset(self, seed=None, options=None):
++        super().reset(seed=seed)
++
++        # Start from native structure + small random perturbation
++        noise = np.random.normal(0, 0.5, self.native_coords.shape)
++        self.ca_coords  = self.native_coords.copy() + noise.astype(np.float32)
++
++        # Initialize backbone angles randomly (unfolded-like)
++        self.phi_angles = np.random.uniform(-np.pi, np.pi, self.N)
++        self.psi_angles = np.random.uniform(-np.pi, np.pi, self.N)
++
++        self.current_energy = compute_energy(
++            self.ca_coords, self.phi_angles, self.psi_angles
++        )
++        self.energy_history = np.full(5, self.current_energy, dtype=np.float32)
++        self.step_count     = 0
++        self.clash_count    = 0
++
++        self.graph = self._build_graph()
++        obs        = self._get_obs()
++        info       = {"energy": self.current_energy, "step": 0}
++        return obs, info
++
++    # ────────────────────────────────────────────────────────
++    def step(self, action: int):
++        assert self.ca_coords is not None, "Call reset() before step()"
++
++        # ── Decode action ───────────────────────────────────
++        residue_idx, angle_type, increment = self._decode_action(action)
++
++        # ── Apply torsion change ────────────────────────────
++        old_phi = self.phi_angles.copy()
++        old_psi = self.psi_angles.copy()
++
++        delta = ANGLE_STEP * (increment - N_INCREMENTS // 2)
++        if angle_type == 0:
++            self.phi_angles[residue_idx] += delta
++            self.phi_angles[residue_idx] = self._wrap_angle(
++                self.phi_angles[residue_idx]
++            )
++        else:
++            self.psi_angles[residue_idx] += delta
++            self.psi_angles[residue_idx] = self._wrap_angle(
++                self.psi_angles[residue_idx]
++            )
++
++        # ── Update Cα coordinates from angles ───────────────
++        self._update_coords(residue_idx)
++
++        # ── Compute new energy ──────────────────────────────
++        new_energy   = compute_energy(
++            self.ca_coords, self.phi_angles, self.psi_angles
++        )
++        energy_delta = compute_energy_delta(self.current_energy, new_energy)
++
++        # ── Clash detection ─────────────────────────────────
++        clash_result = detect_clashes(self.ca_coords)
++        has_clash    = clash_result["has_clash"]
++
++        if has_clash:
++            self.clash_count += 1
++            # Revert angles on clash
++            self.phi_angles = old_phi
++            self.psi_angles = old_psi
++            self._update_coords(residue_idx)
++
++        # ── Compute reward ──────────────────────────────────
++        reward = self._compute_reward(
++            energy_delta, has_clash, new_energy
++        )
++
++        # ── Update state ────────────────────────────────────
++        if not has_clash:
++            self.current_energy = new_energy
++
++        self.energy_history = np.roll(self.energy_history, -1)
++        self.energy_history[-1] = self.current_energy
++        self.step_count += 1
++        self.graph = self._build_graph()
++
++        # ── Termination conditions ───────────────────────────
++        converged = (
++            len(set(np.round(self.energy_history, 3))) == 1
++            and self.step_count > 5
++        )
++        terminated = (
++            self.step_count >= MAX_STEPS or
++            self.clash_count >= MAX_CLASHES or
++            converged
++        )
++        truncated = False
++
++        obs  = self._get_obs()
++        info = {
++            "energy"      : self.current_energy,
++            "energy_delta": energy_delta,
++            "step"        : self.step_count,
++            "clash_count" : self.clash_count,
++            "has_clash"   : has_clash,
++        }
++        return obs, reward, terminated, truncated, info
++
++    # ────────────────────────────────────────────────────────
++    def _compute_reward(self, energy_delta, has_clash, new_energy):
++        reward = R_STEP_PENALTY
++
++        if has_clash:
++            reward += R_CLASH
++            return reward
++
++        reward += R_NO_CLASH
++
++        if energy_delta < -ENERGY_DROP_BIG:
++            reward += R_ENERGY_BIG
++        elif energy_delta < 0:
++            reward += R_ENERGY_SMALL
++        else:
++            reward += R_ENERGY_UP
++
++        # Secondary structure reward        ← ADD THIS LINE
++        reward += self._compute_ss_reward()
++
++        # RMSD bonus
++        rmsd = self._compute_rmsd()
++        if rmsd < RMSD_THRESHOLD:
++            reward += R_RMSD_BONUS
++
++        return reward
++    @staticmethod
++    def _is_helix_region(phi, psi):
++        phi_deg = np.degrees(phi)
++        psi_deg = np.degrees(psi)
++        return (-90.0 <= phi_deg <= -30.0) and (-77.0 <= psi_deg <= -17.0)
++
++    @staticmethod
++    def _is_sheet_region(phi, psi):
++        phi_deg = np.degrees(phi)
++        psi_deg = np.degrees(psi)
++        return (-150.0 <= phi_deg <= -90.0) and (100.0 <= psi_deg <= 175.0)
++
++    def _compute_ss_reward(self):
++        total = 0.0
++        for i in range(self.N):
++            phi = self.phi_angles[i]
++            psi = self.psi_angles[i]
++            if self._is_helix_region(phi, psi):
++                total += R_SS_HELIX
++            elif self._is_sheet_region(phi, psi):
++                total += R_SS_SHEET
++            else:
++                total += R_SS_DISALLOWED
++        return total / self.N
++    # ────────────────────────────────────────────────────────
++    def _decode_action(self, action: int):
++        increment   = action % N_INCREMENTS
++        remainder   = action // N_INCREMENTS
++        angle_type  = remainder % N_ANGLES
++        residue_idx = remainder // N_ANGLES
++        residue_idx = min(residue_idx, self.N - 1)
++        return residue_idx, angle_type, increment
++
++    def _wrap_angle(self, angle: float) -> float:
++        """Wrap angle to [-π, π]."""
++        return float((angle + np.pi) % (2 * np.pi) - np.pi)
++
++    def _update_coords(self, residue_idx: int):
++        """
++        Proper kinematic chain propagation.
++        When a dihedral angle changes at residue i, all residues
++        downstream (i+1, i+2, ..., N-1) must be recomputed.
++        Uses NeRF (Natural Extension Reference Frame) algorithm.
++        """
++        BOND_LENGTH = 3.8  # Cα-Cα virtual bond length in Angstroms
++
++        # Rebuild from residue_idx onward
++        for i in range(residue_idx, self.N):
++            if i == 0:
++                # First residue stays fixed as anchor
++                continue
++
++            if i == 1:
++                # Second residue: place along x-axis from first
++                prev = self.ca_coords[0]
++                self.ca_coords[1] = prev + np.array(
++                    [BOND_LENGTH, 0.0, 0.0], dtype=np.float32
++                )
++                continue
++
++            # For residue i, use NeRF to place it relative to i-2, i-1
++            phi = self.phi_angles[i]
++            psi = self.psi_angles[i - 1]  # psi of previous residue
++
++            # Three reference points
++            a = self.ca_coords[i - 2]
++            b = self.ca_coords[i - 1]
++
++            # Bond vectors
++            bc = b - a
++            bc_norm = bc / (np.linalg.norm(bc) + 1e-8)
++
++            # Build local reference frame
++            # n = normal to the plane of a,b,c
++            if i >= 2:
++                n = np.cross(bc_norm, np.array([0, 0, 1], dtype=np.float32))
++                n_norm = np.linalg.norm(n)
++                if n_norm < 1e-6:
++                    n = np.cross(bc_norm,
++                                 np.array([0, 1, 0], dtype=np.float32))
++                    n_norm = np.linalg.norm(n)
++                n = n / (n_norm + 1e-8)
++
++            # Perpendicular in plane
++            m = np.cross(n, bc_norm)
++
++            # Place new Cα using dihedral angles
++            d = BOND_LENGTH * np.array([
++                np.cos(np.pi - 1.92),  # bond angle ~110°
++                np.sin(np.pi - 1.92) * np.cos(phi),
++                np.sin(np.pi - 1.92) * np.sin(phi)
++            ], dtype=np.float32)
++
++            # Rotate into global frame
++            self.ca_coords[i] = b + (
++                    d[0] * bc_norm +
++                    d[1] * m +
++                    d[2] * n
++            )
++
++    def _build_graph(self) -> Data:
++        """Rebuild PyG graph from current coordinates."""
++        N = self.N
++        ca = self.ca_coords
++
++        # Node features: one-hot AA type (20) + coords (3)
++        aa_feats = self.native_graph.x[:, :20]  # reuse AA type
++        coords_t = torch.tensor(ca, dtype=torch.float)
++        x = torch.cat([aa_feats, coords_t], dim=1)  # [N, 23]
++
++        # Rebuild edges within 8Å
++        edge_src, edge_dst, edge_attrs = [], [], []
++        for i in range(N):
++            for j in range(N):
++                if i == j:
++                    continue
++                diff = ca[j] - ca[i]
++                dist = float(np.linalg.norm(diff))
++                if dist <= 8.0:
++                    is_peptide = 1.0 if abs(i - j) == 1 else 0.0
++                    dn = diff / (dist + 1e-8)
++                    edge_src.append(i)
++                    edge_dst.append(j)
++                    edge_attrs.append([dist, dn[0], dn[1], is_peptide])
++
++        edge_index = torch.tensor([edge_src, edge_dst], dtype=torch.long)
++        edge_attr  = torch.tensor(edge_attrs, dtype=torch.float)
++
++        return Data(x=x, edge_index=edge_index, edge_attr=edge_attr,
++                    pos=coords_t, num_nodes=N)
++
++    def _get_obs(self) -> dict:
++        return {
++            "node_features" : self.graph.x.numpy(),
++            "ca_coords"     : self.ca_coords.copy(),
++            "step"          : np.array([self.step_count], dtype=np.float32),
++            "energy_history": self.energy_history.copy(),
++        }
++
++    def _compute_rmsd(self) -> float:
++        """RMSD between current and native Cα coordinates."""
++        diff = self.ca_coords - self.native_coords
++        return float(np.sqrt(np.mean(np.sum(diff ** 2, axis=1))))
++
++    def get_graph(self) -> Data:
++        """Return current PyG graph for GNN input."""
++        return self.graph
++
++    def render(self):
++        if self.render_mode == "human":
++            print(f"Step: {self.step_count:3d} | "
++                  f"Energy: {self.current_energy:8.3f} | "
++                  f"Clashes: {self.clash_count}")
++
++
++# ── Unit tests ───────────────────────────────────────────────
++if __name__ == "__main__":
++    print("=" * 50)
++    print("ProteinFold-RL — Environment Test")
++    print("=" * 50)
++
++    env = FoldEnv(pdb_id="1L2Y")
++    obs, info = env.reset()
++
++    print(f"\n[INIT] Trp-cage environment")
++    print(f"  N residues     : {env.N}")
++    print(f"  Action dim     : {env.action_dim}")
++    print(f"  Initial energy : {info['energy']:.4f}")
++    print(f"  Obs keys       : {list(obs.keys())}")
++
++    # Run 100 random steps
++    print(f"\n[TEST] Running 100 random steps...")
++    total_reward = 0
++    for i in range(100):
++        action = env.action_space.sample()
++        obs, reward, terminated, truncated, info = env.step(action)
++        total_reward += reward
++        if terminated:
++            obs, info = env.reset()
++
++    print(f"  Completed without crash ✓")
++    print(f"  Total reward   : {total_reward:.3f}")
++
++    # Verify all 7 reward cases
++    print(f"\n[TEST] Reward case verification:")
++    print(f"  R_ENERGY_BIG   = {R_ENERGY_BIG}  ✓")
++    print(f"  R_ENERGY_SMALL = {R_ENERGY_SMALL}  ✓")
++    print(f"  R_NO_CLASH     = {R_NO_CLASH}  ✓")
++    print(f"  R_CLASH        = {R_CLASH}  ✓")
++    print(f"  R_ENERGY_UP    = {R_ENERGY_UP}  ✓")
++    print(f"  R_STEP_PENALTY = {R_STEP_PENALTY}  ✓")
++    print(f"  R_RMSD_BONUS   = {R_RMSD_BONUS} ✓")
++
++    print(f"\n{'=' * 50}")
++    print("CHECKPOINT-02 — Environment stable.")
++    print("=" * 50)
+\ No newline at end of file
+Index: csv_to_json.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/csv_to_json.py b/csv_to_json.py
+--- a/csv_to_json.py	(revision 71456e9b6125c185e2860ce677a90484ef9d4150)
++++ b/csv_to_json.py	(date 1777138940141)
+@@ -1,0 +1,81 @@
++"""
++csv_to_json.py
++ProteinFold-RL — Convert training log CSV to JSON
++
++Run this once after training completes:
++    python csv_to_json.py
++
++Input  : logs/training_log.csv
++Output : frontend/assets/data/training_log.json
++
++The JSON is fetched by charts.js to populate the dashboard
++with real training data instead of synthetic fallback.
++"""
++
++import csv
++import json
++import os
++import sys
++
++INPUT_CSV  = os.path.join("logs", "training_log.csv")
++OUTPUT_JSON = os.path.join("frontend", "assets", "data", "training_log.json")
++
++
++def convert():
++    # ── Validate input ────────────────────────────────────────
++    if not os.path.exists(INPUT_CSV):
++        print(f"[ERROR] Input file not found: {INPUT_CSV}")
++        print("  Run train.py first to generate the training log.")
++        sys.exit(1)
++
++    if os.path.getsize(INPUT_CSV) == 0:
++        print(f"[ERROR] Input file is empty: {INPUT_CSV}")
++        print("  Training may not have completed successfully.")
++        sys.exit(1)
++
++    # ── Read CSV ──────────────────────────────────────────────
++    rows = []
++    with open(INPUT_CSV, newline="", encoding="utf-8") as f:
++        reader = csv.DictReader(f)
++        for row in reader:
++            rows.append({
++                "episode"     : int(row["episode"]),
++                "protein"     : row.get("protein", "1L2Y"),
++                "stage"       : int(row.get("stage", 1)),
++                "total_reward": float(row["total_reward"]),
++                "final_energy": float(row["final_energy"]),
++                "rmsd"        : float(row["rmsd"]),
++                "steps"       : int(row["steps"]),
++                "clashes"     : int(row["clashes"]),
++                "policy_loss" : float(row.get("policy_loss", 0)),
++                "value_loss"  : float(row.get("value_loss",  0)),
++                "entropy"     : float(row.get("entropy",     0)),
++            })
++
++    if len(rows) == 0:
++        print(f"[ERROR] CSV has no data rows.")
++        sys.exit(1)
++
++    # ── Write JSON ────────────────────────────────────────────
++    os.makedirs(os.path.dirname(OUTPUT_JSON), exist_ok=True)
++    with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
++        json.dump(rows, f, indent=2)
++
++    # ── Summary ───────────────────────────────────────────────
++    energies = [r["final_energy"] for r in rows]
++    rmsds    = [r["rmsd"]         for r in rows]
++
++    print("=" * 55)
++    print("ProteinFold-RL — CSV → JSON Conversion Complete")
++    print("=" * 55)
++    print(f"  Episodes converted : {len(rows)}")
++    print(f"  Input              : {INPUT_CSV}")
++    print(f"  Output             : {OUTPUT_JSON}")
++    print(f"  Energy range       : {min(energies):.2f} → {max(energies):.2f} kcal/mol")
++    print(f"  RMSD range         : {min(rmsds):.3f} → {max(rmsds):.3f} Å")
++    print("=" * 55)
++    print("  Dashboard will now load real training data ✓")
++
++
++if __name__ == "__main__":
++    convert()
+\ No newline at end of file
+Index: env/energy.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/env/energy.py b/env/energy.py
+--- a/env/energy.py	(revision 71456e9b6125c185e2860ce677a90484ef9d4150)
++++ b/env/energy.py	(date 1777138748824)
+@@ -1,0 +1,125 @@
++import numpy as np
++
++
++# ── Lennard-Jones parameters ────────────────────────────────
++LJ_EPSILON = 0.238  # kcal/mol (typical carbon-carbon)
++LJ_SIGMA   = 3.8    # Angstroms (Cα-Cα effective radius)
++
++# ── Torsion energy parameters ───────────────────────────────
++TORSION_WEIGHT = 0.5
++
++# ── Preferred backbone angles (Ramachandran favored) ────────
++# Alpha helix: phi=-57, psi=-47
++# Beta sheet:  phi=-119, psi=113
++HELIX_PHI  = np.radians(-57.0)
++HELIX_PSI  = np.radians(-47.0)
++SHEET_PHI  = np.radians(-119.0)
++SHEET_PSI  = np.radians(113.0)
++
++
++def lj_potential(dist: float) -> float:
++    """
++    Simplified Lennard-Jones potential between two Cα atoms.
++    V(r) = 4ε [(σ/r)^12 - (σ/r)^6]
++    Clamped to avoid explosion at very short distances.
++    """
++    if dist < 1e-3:
++        return 100.0  # hard wall
++    ratio = LJ_SIGMA / dist
++    ratio6  = ratio ** 6
++    ratio12 = ratio6 ** 2
++    v = 4.0 * LJ_EPSILON * (ratio12 - ratio6)
++    return float(np.clip(v, -10.0, 100.0))
++
++
++def torsion_energy(phi: float, psi: float) -> float:
++    """
++    Simplified torsion energy — penalizes deviation from
++    favored Ramachandran regions (helix or sheet).
++    Returns the minimum energy across both favored regions.
++    """
++    def angle_diff(a, b):
++        d = abs(a - b) % (2 * np.pi)
++        return min(d, 2 * np.pi - d)
++
++    helix_cost = (
++        angle_diff(phi, HELIX_PHI) ** 2 +
++        angle_diff(psi, HELIX_PSI) ** 2
++    )
++    sheet_cost = (
++        angle_diff(phi, SHEET_PHI) ** 2 +
++        angle_diff(psi, SHEET_PSI) ** 2
++    )
++    return TORSION_WEIGHT * float(min(helix_cost, sheet_cost))
++
++
++def compute_energy(ca_coords: np.ndarray, phi_angles: np.ndarray,
++                   psi_angles: np.ndarray) -> float:
++    """
++    Total energy of a protein conformation.
++
++    Args:
++        ca_coords  : [N, 3] Cα coordinates in Angstroms
++        phi_angles : [N]    phi backbone dihedral angles in radians
++        psi_angles : [N]    psi backbone dihedral angles in radians
++
++    Returns:
++        total_energy : float (lower = more stable)
++    """
++    N = len(ca_coords)
++    lj_energy = 0.0
++    tor_energy = 0.0
++
++    # ── Pairwise LJ (non-bonded, skip i±1 neighbors) ────────
++    for i in range(N):
++        for j in range(i + 2, N):  # skip peptide bond neighbors
++            dist = float(np.linalg.norm(ca_coords[i] - ca_coords[j]))
++            lj_energy += lj_potential(dist)
++
++    # ── Torsion energy per residue ───────────────────────────
++    for i in range(N):
++        tor_energy += torsion_energy(phi_angles[i], psi_angles[i])
++
++    return lj_energy + tor_energy
++
++
++def compute_energy_delta(energy_old: float, energy_new: float) -> float:
++    """Returns energy change. Negative = improvement."""
++    return energy_new - energy_old
++
++
++if __name__ == "__main__":
++    import os
++    import sys
++    sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++    from env.protein_graph import pdb_to_graph
++
++    print("=" * 50)
++    print("ProteinFold-RL — Energy Function Test")
++    print("=" * 50)
++
++    for pdb_id, name in [("1L2Y", "Trp-cage"), ("1YRF", "Villin")]:
++        path = os.path.join(
++            os.path.dirname(__file__),
++            f"../data/structures/{pdb_id}.pdb"
++        )
++        graph = pdb_to_graph(path)
++        N = graph.num_nodes
++        ca_coords = graph.pos.numpy()
++
++        # Random angles as placeholder (env will track real angles)
++        phi = np.random.uniform(-np.pi, np.pi, N)
++        psi = np.random.uniform(-np.pi, np.pi, N)
++
++        energy = compute_energy(ca_coords, phi, psi)
++        print(f"\n[{name}] ({pdb_id})")
++        print(f"  Residues : {N}")
++        print(f"  Energy   : {energy:.4f} kcal/mol")
++        assert isinstance(energy, float), "Energy must be a float"
++        assert not np.isnan(energy),      "Energy must not be NaN"
++        assert not np.isinf(energy),      "Energy must not be Inf"
++        print(f"  [PASS] Energy function valid ✓")
++
++    print("\n" + "=" * 50)
++    print("Energy function ready.")
++    print("=" * 50)
+\ No newline at end of file
+Index: train.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/train.py b/train.py
+--- a/train.py	(revision 71456e9b6125c185e2860ce677a90484ef9d4150)
++++ b/train.py	(date 1777138994011)
+@@ -1,0 +1,271 @@
++"""
++train.py
++ProteinFold-RL — Curriculum Training Loop (v2)
++
++Upgraded from single-protein v1 to 8-protein curriculum.
++
++What changed vs v1
++------------------
++- ProteinCurriculum drives protein selection each episode
++- Policy created once at MAX action dim — shared across all proteins
++- Action safely clamped to each protein's valid range
++- Per-episode log now includes protein ID + curriculum stage
++- Curriculum state saved alongside every checkpoint
++- Fresh start: old logs are cleared on each new run
++
++What did NOT change
++-------------------
++- PPO update logic (identical)
++- HORIZON, GAMMA, all PPO hyperparameters (identical)
++- FoldEnv interface (identical)
++- Checkpoint format (identical)
++
++Run
++---
++  python train.py              # full curriculum, 2000 episodes
++  python train.py --protein 1L2Y   # single-protein mode (v1 compat)
++"""
++
++import argparse
++import os
++import csv
++import time
++
++import numpy as np
++import torch
++
++from env.fold_env import FoldEnv
++from model.gnn_policy import GNNPolicyNetwork
++from agent.ppo import PPOTrainer, HORIZON
++from data.curriculum import ProteinCurriculum
++from config import MAX_ACTION_DIM, CHECKPOINT_PATH
++
++# ── Config ────────────────────────────────────────────────────
++N_EPISODES     = 500
++LOG_EVERY      = 5
++
++SAVE_EVERY     = 100
++
++LOG_FILE       = "logs/training_log.csv"
++CURR_STATE     = "checkpoints/curriculum_state.json"
++
++# Largest protein is 2HHB: 141 residues × 2 angles × 12 increments
++# Policy is always built at this size so weights are shared across
++# all proteins without any architecture change between episodes.
++
++
++os.makedirs("checkpoints", exist_ok=True)
++os.makedirs("logs", exist_ok=True)
++
++# ── Helpers ───────────────────────────────────────────────────
++
++def compute_rmsd(coords: np.ndarray, native: np.ndarray) -> float:
++    """Root-mean-square deviation between two sets of Cα coordinates."""
++    diff = coords - native
++    return float(np.sqrt(np.mean(np.sum(diff ** 2, axis=1))))
++
++
++def init_log():
++    """Write CSV header — called once at the start of a fresh run."""
++    with open(LOG_FILE, "w", newline="") as f:
++        csv.writer(f).writerow([
++            "episode", "protein", "stage",
++            "total_reward", "final_energy", "rmsd",
++            "steps", "clashes",
++            "policy_loss", "value_loss", "entropy",
++        ])
++
++
++def append_log(episode, protein, stage, ep_reward,
++               final_energy, rmsd, ep_steps, ep_clashes, stats):
++    """Append one episode row to the CSV log."""
++    with open(LOG_FILE, "a", newline="") as f:
++        csv.writer(f).writerow([
++            episode, protein, stage,
++            round(ep_reward,    4),
++            round(final_energy, 4),
++            round(rmsd,         4),
++            ep_steps,
++            ep_clashes,
++            round(stats.get("policy_loss", 0), 4),
++            round(stats.get("value_loss",  0), 4),
++            round(stats.get("entropy",     0), 4),
++        ])
++
++
++# ── Main ──────────────────────────────────────────────────────
++
++def train(n_episodes: int = N_EPISODES,
++          single_protein: str = None):
++    """
++    Main training loop.
++
++    Parameters
++    ----------
++    n_episodes     : total episodes to run
++    single_protein : if set, skip curriculum and train on this
++                     one protein only (v1 compatibility mode)
++    """
++    print("=" * 62)
++    print("ProteinFold-RL — Curriculum Training v2")
++    if single_protein:
++        print(f"  Mode     : single-protein ({single_protein})")
++    else:
++        print(f"  Mode     : 8-protein curriculum")
++    print(f"  Episodes : {n_episodes}")
++    print("=" * 62)
++
++    # ── Curriculum ────────────────────────────────────────────
++    if single_protein:
++        curriculum  = None
++        current_pdb = single_protein
++    else:
++        curriculum  = ProteinCurriculum()
++        current_pdb = curriculum.current_protein().pdb_id
++
++    # ── Policy — built once at MAX action dim ─────────────────
++    policy  = GNNPolicyNetwork(action_dim=MAX_ACTION_DIM)
++    trainer = PPOTrainer(policy=policy, action_dim=MAX_ACTION_DIM)
++
++    # ── Environment — rebuilt when protein changes ────────────
++    env           = FoldEnv(pdb_id=current_pdb)
++    native_coords = env.native_coords.copy()
++
++    # ── Logs ──────────────────────────────────────────────────
++    init_log()
++
++    # ── State ─────────────────────────────────────────────────
++    best_rmsd   = float("inf")
++    best_energy = float("inf")
++    step_count  = 0
++    start_time  = time.time()
++
++    print(f"\n[START] First protein: {current_pdb}\n")
++
++    # ── Episode loop ──────────────────────────────────────────
++    for episode in range(1, n_episodes + 1):
++
++        # Curriculum selects protein for this episode
++        if curriculum is not None:
++            entry       = curriculum.sample_protein()
++            episode_pdb = entry.pdb_id
++
++            # Rebuild env only when protein changes
++            if episode_pdb != current_pdb:
++                env           = FoldEnv(pdb_id=episode_pdb)
++                native_coords = env.native_coords.copy()
++                current_pdb   = episode_pdb
++        else:
++            episode_pdb = single_protein
++
++        # ── Run one episode ───────────────────────────────────
++        obs, info  = env.reset()
++        ep_reward  = 0.0
++        ep_steps   = 0
++        ep_clashes = 0
++        done       = False
++        stats      = {}
++
++        while not done:
++            graph = env.get_graph()
++
++            action, log_prob, value, entropy = policy.get_action(graph)
++
++            # Clamp action to this protein's valid range.
++            # Policy outputs up to MAX_ACTION_DIM logits;
++            # only env.action_dim are valid for the current protein.
++            action = action % env.action_dim
++
++            obs, reward, terminated, truncated, info = env.step(action)
++            done = terminated or truncated
++
++            trainer.store(graph, action, reward, log_prob, value, done)
++            ep_reward  += reward
++            ep_steps   += 1
++            ep_clashes += int(info["has_clash"])
++            step_count += 1
++
++            # PPO update every HORIZON steps
++            if step_count % HORIZON == 0:
++                last_val = 0.0
++                if not done:
++                    with torch.no_grad():
++                        _, last_val_t = policy(env.get_graph())
++                        last_val = last_val_t.item()
++                stats = trainer.update(last_val)
++
++        # ── Episode metrics ───────────────────────────────────
++        final_energy = info["energy"]
++        rmsd         = compute_rmsd(env.ca_coords, native_coords)
++
++        if rmsd        < best_rmsd:    best_rmsd    = rmsd
++        if final_energy < best_energy: best_energy  = final_energy
++
++        # ── Record in curriculum + check advancement ──────────
++        stage = 1
++        if curriculum is not None:
++            curriculum.record(episode_pdb, rmsd)
++            curriculum.maybe_advance()
++            stage = curriculum.current_stage
++
++        # ── Log ───────────────────────────────────────────────
++        append_log(episode, episode_pdb, stage,
++                   ep_reward, final_energy, rmsd,
++                   ep_steps, ep_clashes, stats)
++
++        # ── Console ───────────────────────────────────────────
++        if episode % LOG_EVERY == 0:
++            elapsed = (time.time() - start_time) / 60
++            curr_status = curriculum.status() if curriculum else episode_pdb
++            print(
++                f"Ep {episode:5d}/{n_episodes} | "
++                f"Reward {ep_reward:7.2f} | "
++                f"Energy {final_energy:7.2f} | "
++                f"RMSD {rmsd:.3f}Å | "
++                f"{curr_status} | "
++                f"{elapsed:.1f}m"
++            )
++
++        # ── Checkpoint ────────────────────────────────────────
++        if episode % SAVE_EVERY == 0:
++            ckpt = os.path.join("checkpoints", f"policy_ep{episode}.pt")
++            trainer.save(ckpt)
++            if curriculum is not None:
++                curriculum.save(CURR_STATE)
++            print(f"  [CKPT] Episode {episode} saved.")
++
++    # ── Final ─────────────────────────────────────────────────
++    elapsed = (time.time() - start_time) / 60
++    print("\n" + "=" * 62)
++    print("Training Complete!")
++    print(f"  Episodes    : {n_episodes}")
++    print(f"  Best RMSD   : {best_rmsd:.3f} Å")
++    print(f"  Best Energy : {best_energy:.3f} kcal/mol")
++    print(f"  Time        : {elapsed:.1f} minutes")
++    print(f"  Log         : {LOG_FILE}")
++    print("=" * 62)
++
++    if curriculum is not None:
++        print(curriculum.summary())
++
++    trainer.save(CHECKPOINT_PATH)
++    if curriculum is not None:
++        curriculum.save(CURR_STATE)
++
++    return trainer
++
++
++# ── CLI ───────────────────────────────────────────────────────
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser()
++    parser.add_argument(
++        "--episodes", type=int, default=N_EPISODES,
++        help=f"Number of training episodes (default {N_EPISODES})"
++    )
++    parser.add_argument(
++        "--protein", type=str, default=None,
++        help="Single-protein mode, e.g. --protein 1L2Y"
++    )
++    args = parser.parse_args()
++    train(n_episodes=args.episodes, single_protein=args.protein)
+\ No newline at end of file
+Index: env/clash_detect.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/env/clash_detect.py b/env/clash_detect.py
+--- a/env/clash_detect.py	(revision 71456e9b6125c185e2860ce677a90484ef9d4150)
++++ b/env/clash_detect.py	(date 1777138740889)
+@@ -1,0 +1,100 @@
++import numpy as np
++
++# Minimum allowed distance between non-bonded Cα atoms
++CLASH_THRESHOLD = 1.5   # Angstroms — hard clash
++SOFT_THRESHOLD  = 3.0   # Angstroms — soft warning (not penalized, just tracked)
++
++
++def detect_clashes(ca_coords: np.ndarray) -> dict:
++    """
++    Detect steric clashes between non-bonded Cα atoms.
++
++    Args:
++        ca_coords : [N, 3] Cα coordinates in Angstroms
++
++    Returns:
++        dict with keys:
++            has_clash     : bool   — True if any hard clash exists
++            clash_count   : int    — number of clashing pairs
++            soft_count    : int    — number of soft (warning) pairs
++            min_dist      : float  — minimum pairwise distance found
++            clash_pairs   : list   — list of (i, j) clashing pairs
++    """
++    N = len(ca_coords)
++    clash_pairs = []
++    soft_pairs  = []
++    min_dist    = float('inf')
++
++    for i in range(N):
++        for j in range(i + 2, N):  # skip peptide bond neighbors (i±1)
++            diff = ca_coords[i] - ca_coords[j]
++            dist = float(np.linalg.norm(diff))
++
++            if dist < min_dist:
++                min_dist = dist
++
++            if dist < CLASH_THRESHOLD:
++                clash_pairs.append((i, j))
++            elif dist < SOFT_THRESHOLD:
++                soft_pairs.append((i, j))
++
++    return {
++        "has_clash"   : len(clash_pairs) > 0,
++        "clash_count" : len(clash_pairs),
++        "soft_count"  : len(soft_pairs),
++        "min_dist"    : min_dist if min_dist < float('inf') else 0.0,
++        "clash_pairs" : clash_pairs
++    }
++
++
++def is_valid_conformation(ca_coords: np.ndarray) -> bool:
++    """Quick boolean check — True if no hard clashes."""
++    result = detect_clashes(ca_coords)
++    return not result["has_clash"]
++
++
++if __name__ == "__main__":
++    import os
++    import sys
++    sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++    from env.protein_graph import pdb_to_graph
++
++    print("=" * 50)
++    print("ProteinFold-RL — Clash Detection Test")
++    print("=" * 50)
++
++    # ── Test 1: Native structure (should have no clashes) ───
++    for pdb_id, name in [("1L2Y", "Trp-cage"), ("1YRF", "Villin")]:
++        path = os.path.join(
++            os.path.dirname(__file__),
++            f"../data/structures/{pdb_id}.pdb"
++        )
++        graph = pdb_to_graph(path)
++        ca_coords = graph.pos.numpy()
++        result = detect_clashes(ca_coords)
++
++        print(f"\n[{name}] Native structure:")
++        print(f"  Hard clashes : {result['clash_count']}")
++        print(f"  Soft clashes : {result['soft_count']}")
++        print(f"  Min dist     : {result['min_dist']:.3f} Å")
++        print(f"  Valid        : {not result['has_clash']}")
++        assert not result["has_clash"], f"Native structure should not clash!"
++        print(f"  [PASS] No clashes in native structure ✓")
++
++    # ── Test 2: Artificial clash (should be detected) ───────
++    print(f"\n[TEST] Artificial clash detection:")
++    coords = np.array([
++        [0.0, 0.0, 0.0],
++        [1.0, 0.0, 0.0],   # peptide neighbor — skip
++        [1.0, 0.0, 0.0],   # non-bonded, same position = clash
++        [5.0, 0.0, 0.0],
++        [10.0, 0.0, 0.0],
++    ], dtype=np.float32)
++    result = detect_clashes(coords)
++    assert result["has_clash"], "Should detect artificial clash!"
++    print(f"  Clash detected: {result['clash_count']} pair(s) ✓")
++    print(f"  [PASS] Clash detection working ✓")
++
++    print("\n" + "=" * 50)
++    print("Clash detection ready.")
++    print("=" * 50)
+\ No newline at end of file
